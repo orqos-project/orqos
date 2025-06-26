@@ -1,0 +1,29 @@
+[package]
+name = "orqos"
+version = "0.1.0"
+edition = "2021"
+authors = ["Andrea M. <andrea@andreamancuso.dev>"]
+license = "MIT"
+description = "Docker management tool for Rezn"
+repository = "https://github.com/orqos-project/orqos"
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+tracing = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+chrono = "0.4"
+sled = "0.34"
+ctrlc = "3.4.7"
+bollard = "0.19.1"
+tokio = { version = "1.45.1", features = [
+    "rt-multi-thread",
+    "time",
+    "signal",
+    "macros",
+    "sync",
+] }
+futures = "0.3.31"
+futures-util = "0.3.31"
+tracing-subscriber = "0.3.19"
