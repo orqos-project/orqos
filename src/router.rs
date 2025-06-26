@@ -12,7 +12,10 @@ async fn list_containers(
 
     let opts = ListContainersOptionsBuilder::new().all(true).build();
     match app.docker.list_containers(Some(opts)).await {
-        Ok(list) => Ok(Json(list)),
+        Ok(list) => {
+            tracing::debug!("Listed containers: {:?}", list);
+            Ok(Json(list))
+        }
         Err(e) => Err((
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to list containers: {e}"),
