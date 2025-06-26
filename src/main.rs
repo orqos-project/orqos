@@ -1,44 +1,47 @@
-use anyhow::{Context, Result};
-use bollard::query_parameters::ListContainersOptionsBuilder;
+pub mod events;
+pub mod router;
+pub mod state;
+
+use std::sync::Arc;
+
+use anyhow::Result;
 use bollard::Docker;
-use tokio::time::{timeout, Duration};
+use bollard::API_DEFAULT_VERSION;
+use tokio::net::TcpListener;
+use tokio::sync::broadcast;
+
+use crate::events::spawn_event_fanout;
+use crate::router::build_router;
+use crate::state::AppState;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    print!(
-        "{}",
-        "This example lists all running containers.\n\
-         Make sure you have a Docker daemon running locally.\n"
-    );
+    let docker = match Docker::connect_with_local_defaults() {
+        Ok(d) => d,
+        Err(_) => {
+            // Fall back to Desktop socket if DEFAULT_SOCKET or DOCKER_HOST unset
+            let sock = format!("{}/.docker/desktop/docker.sock", std::env::var("HOME")?);
+            Docker::connect_with_unix(&sock, 120, API_DEFAULT_VERSION)?
+        }
+    };
+    tracing::info!("Connected to Docker {:?}", docker.version().await?.version);
 
-    let docker = Docker::connect_with_local_defaults().context("couldn't create Docker client")?;
+    // 2. Broadcast channel (100-message ring buffer)
+    let (tx, _) = broadcast::channel(100);
 
-    print!("{}", "a\n");
+    // 3. Spawn fan-out
+    spawn_event_fanout(docker.clone(), tx.clone()).await;
 
-    timeout(Duration::from_secs(2), docker.ping())
-        .await
-        .context("ping timed out")? // Tokio timeout error
-        .context("daemon unreachable")?;
+    // 4. Serve HTTP
+    let app_state = Arc::new(AppState {
+        docker,
+        events_tx: tx,
+    });
+    let router = build_router(app_state);
 
-    print!("{}", "b\n");
-
-    let mut filters: std::collections::HashMap<String, Vec<String>> =
-        std::collections::HashMap::new();
-    filters.insert("status".into(), vec!["running".into()]);
-
-    let opts = ListContainersOptionsBuilder::new()
-        .all(true) // keep stopped containers too
-        .size(false) // don't calculate disk usage
-        .filters(&filters) // any &HashMap<String, Vec<String>>
-        .build();
-
-    let list = docker.list_containers(Some(opts)).await?;
-
-    for c in list {
-        println!("{} → {:?}", c.id.unwrap_or_default(), c.names);
-    }
-
-    print!("{}", "c\n");
+    tracing::info!("Listening on 0.0.0.0:3000");
+    let listener = TcpListener::bind("0.0.0.0:3000").await?;
+    axum::serve(listener, router).await?;
 
     Ok(())
 }
