@@ -3,21 +3,29 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
-use bollard::secret::ContainerSummary;
+use bollard::models::ContainerSummary;
 use serde::Deserialize;
 use std::sync::Arc;
 
 use crate::state::AppState;
 
-#[derive(Deserialize, Default)]
-pub(crate) struct ContainerQuery {
+#[derive(Deserialize, Default, utoipa::IntoParams)]
+pub struct ContainerQuery {
     status: Option<String>, // status=running,exited
     label: Option<String>,  // label=k=v,label=x=y
     name: Option<String>,   // name=foo,name=bar
     all: Option<bool>,
 }
 
-pub(crate) async fn list_containers(
+#[utoipa::path(
+    get,
+    path = "/containers",
+    params(ContainerQuery),
+    responses(
+        (status = 200, body = Object)
+    )
+)]
+pub async fn list_containers(
     State(app): State<Arc<AppState>>,
     Query(q): Query<ContainerQuery>,
 ) -> Result<Json<Vec<ContainerSummary>>, impl IntoResponse> {
