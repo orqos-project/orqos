@@ -949,6 +949,7 @@ dependencies = [
  "ctrlc",
  "futures",
  "futures-util",
+ "rand",
  "serde",
  "serde_json",
  "sled",
