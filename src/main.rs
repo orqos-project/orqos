@@ -1,5 +1,6 @@
 pub mod events;
 pub mod router;
+pub mod routes;
 pub mod state;
 
 use std::sync::Arc;
