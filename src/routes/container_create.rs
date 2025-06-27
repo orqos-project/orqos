@@ -46,17 +46,21 @@ pub struct ContainerInfo {
     pub ports: std::collections::HashMap<String, u16>,
 }
 
-fn pick_host_port() -> u16 {
+fn pick_host_port() -> Result<u16, String> {
     const MAX_ATTEMPTS: u32 = 100;
     let mut attempts = 0;
+    let mut rng_instance = rng();
+
     loop {
-        let p: u16 = rng().random_range(20000..=65535);
+        let p: u16 = rng_instance.random_range(20000..=65535);
         if std::net::TcpListener::bind(("127.0.0.1", p)).is_ok() {
-            return p;
+            return Ok(p);
         }
         attempts += 1;
         if attempts >= MAX_ATTEMPTS {
-            panic!("Failed to find a free port after {MAX_ATTEMPTS} attempts");
+            return Err(format!(
+                "Failed to find a free port after {MAX_ATTEMPTS} attempts"
+            ));
         }
     }
 }
@@ -91,9 +95,12 @@ pub(crate) async fn create_container(
     let mut port_report: HashMap<String, u16> = HashMap::new();
 
     if let Some(maps) = &req.ports {
-        for PortMap { container, host } in maps {
+        for &PortMap { container, host } in maps {
             let key = format!("{}/tcp", container);
-            let host_port = host.unwrap_or_else(pick_host_port);
+            let host_port = match host {
+                Some(hp) => hp,
+                None => pick_host_port().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?,
+            };
             exposed.insert(key.clone(), HashMap::new());
             bindings.insert(
                 key.clone(),
@@ -140,7 +147,7 @@ pub(crate) async fn create_container(
         } else {
             Some(exposed)
         },
-        host_config: Some(*Box::new(host_cfg)),
+        host_config: Some(host_cfg),
         ..Default::default()
     };
 
