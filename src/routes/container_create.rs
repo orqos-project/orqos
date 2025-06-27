@@ -1,16 +1,14 @@
 use axum::{
     extract::{Json, State},
     http::StatusCode,
-    routing::post,
-    Router,
 };
 use bollard::{
-    container::{Config, CreateContainerOptions, StartContainerOptions},
-    models::PortBinding,
+    models::{ContainerCreateBody, PortBinding},
+    query_parameters::CreateContainerOptions,
     service::HostConfig,
     Docker,
 };
-use rand::{thread_rng, Rng};
+use rand::{rng, Rng};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
 
@@ -48,12 +46,17 @@ pub struct ContainerInfo {
     pub ports: std::collections::HashMap<String, u16>,
 }
 
-/// Pick a free high port on localhost; retry until successful.
 fn pick_host_port() -> u16 {
+    const MAX_ATTEMPTS: u32 = 100;
+    let mut attempts = 0;
     loop {
-        let p: u16 = thread_rng().gen_range(20000..60000);
+        let p: u16 = rng().random_range(20000..=65535);
         if std::net::TcpListener::bind(("127.0.0.1", p)).is_ok() {
-            break p;
+            return p;
+        }
+        attempts += 1;
+        if attempts >= MAX_ATTEMPTS {
+            panic!("Failed to find a free port after {MAX_ATTEMPTS} attempts");
         }
     }
 }
@@ -129,7 +132,7 @@ pub(crate) async fn create_container(
     };
 
     // Container config
-    let cfg = Config {
+    let cfg = ContainerCreateBody {
         image: Some(req.image),
         env: req.env,
         exposed_ports: if exposed.is_empty() {
@@ -137,13 +140,12 @@ pub(crate) async fn create_container(
         } else {
             Some(exposed)
         },
-        host_config: Some(host_cfg),
+        host_config: Some(*Box::new(host_cfg)),
         ..Default::default()
     };
 
-    // Create + start
-    let opts = CreateContainerOptions::<&str> {
-        name: &cname,
+    let opts = CreateContainerOptions {
+        name: Some(cname.clone()),
         ..Default::default()
     };
 
@@ -153,7 +155,10 @@ pub(crate) async fn create_container(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     docker
-        .start_container(&cname, None::<StartContainerOptions<String>>)
+        .start_container(
+            &cname,
+            None::<bollard::query_parameters::StartContainerOptions>,
+        )
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
