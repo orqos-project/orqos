@@ -6,16 +6,17 @@ use axum::routing::post;
 use axum::{response::IntoResponse, routing::get, Router};
 use utoipa::OpenApi;
 
-use crate::routes::container_create::create_container;
+use crate::routes::container_create::create_container_handler;
 use crate::routes::container_stop::stop_container_handler;
-pub use crate::routes::containers_list::list_containers;
+pub use crate::routes::containers_list::list_containers_handler;
+use crate::routes::exec::{exec_once_handler, exec_ws_handler};
 use crate::state::AppState;
 
 #[derive(OpenApi)]
 #[openapi(
     info(description = "Orqos Api"),
     paths(
-        crate::routes::containers_list::list_containers,
+        crate::routes::containers_list::list_containers_handler,
         crate::routes::container_stop::stop_container_handler
     )
 )]
@@ -33,9 +34,11 @@ async fn events_ws(State(app): State<Arc<AppState>>, ws: WebSocketUpgrade) -> im
 
 pub(crate) fn build_router(app: Arc<AppState>) -> Router {
     Router::new()
-        .route("/containers", get(list_containers))
-        .route("/containers", post(create_container))
+        .route("/containers", get(list_containers_handler))
+        .route("/containers", post(create_container_handler))
         .route("/containers/:id/stop", post(stop_container_handler))
+        .route("/containers/:id/exec", post(exec_once_handler))
+        .route("/containers/:id/exec/ws", get(exec_ws_handler))
         .route("/events", get(events_ws))
         .with_state(app)
         .merge(

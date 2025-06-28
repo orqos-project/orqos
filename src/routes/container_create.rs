@@ -82,7 +82,7 @@ fn parse_bytes(s: &str) -> u64 {
     }
 }
 
-pub(crate) async fn create_container(
+pub(crate) async fn create_container_handler(
     State(app): State<Arc<AppState>>,
     Json(req): Json<ContainerCreate>,
 ) -> Result<Json<ContainerInfo>, (StatusCode, String)> {

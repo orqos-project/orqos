@@ -25,7 +25,7 @@ pub struct ContainerQuery {
         (status = 200, body = Object)
     )
 )]
-pub async fn list_containers(
+pub async fn list_containers_handler(
     State(app): State<Arc<AppState>>,
     Query(q): Query<ContainerQuery>,
 ) -> Result<Json<Vec<ContainerSummary>>, impl IntoResponse> {
