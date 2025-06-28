@@ -14,7 +14,10 @@ use crate::state::AppState;
 #[derive(OpenApi)]
 #[openapi(
     info(description = "Orqos Api"),
-    paths(crate::routes::containers_list::list_containers)
+    paths(
+        crate::routes::containers_list::list_containers,
+        crate::routes::container_stop::stop_container_handler
+    )
 )]
 struct ApiDoc;
 

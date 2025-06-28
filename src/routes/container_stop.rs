@@ -8,19 +8,29 @@ use bollard::errors::Error as BollardError;
 use bollard::query_parameters::StopContainerOptions;
 use serde::Deserialize;
 use std::sync::Arc;
+use utoipa::ToSchema;
 
 use crate::state::AppState;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct StopContainerRequest {
     pub t: Option<u64>,
     pub signal: Option<String>,
 }
 
-/// Stop a running container.  
-/// `container_id` can be the ID or name.
-/// Returns 204 on success, 404 if the container isn’t found,
-/// 500 for anything Bollard spits back.
+#[utoipa::path(
+    post,
+    path = "/containers/:id/stop",
+    params(
+        ("id" = String, Path, description = "Container ID or name")
+    ),
+    request_body(content = StopContainerRequest, description = "Stop options", content_type = "application/json"),
+    responses(
+        (status = 204, description = "Container stopped successfully"),
+        (status = 404, description = "Container not found"),
+        (status = 500, description = "Internal server error")
+    )
+)]
 pub async fn stop_container_handler(
     State(state): State<Arc<AppState>>,
     Path(container_id): Path<String>,
@@ -30,7 +40,9 @@ pub async fn stop_container_handler(
         .map(|Json(req)| (req.t, req.signal))
         .unwrap_or((Some(5), None));
 
-    match stop_container(&state.docker, &container_id, t, signal).await {
+    let capped_t = t.map(|v| v.min(60));
+
+    match stop_container(&state.docker, &container_id, capped_t, signal).await {
         Ok(()) => StatusCode::NO_CONTENT,
         Err(BollardError::DockerResponseServerError { status_code, .. }) if status_code == 404 => {
             StatusCode::NOT_FOUND
