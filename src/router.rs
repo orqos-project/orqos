@@ -13,6 +13,7 @@ use crate::routes::container_create::create_container_handler;
 use crate::routes::container_stop::stop_container_handler;
 pub use crate::routes::containers_list::list_containers_handler;
 use crate::routes::exec::{exec_once_handler, exec_ws_handler};
+use crate::routes::write_file::write_file_handler;
 use crate::state::AppState;
 
 #[derive(OpenApi)]
@@ -22,7 +23,8 @@ use crate::state::AppState;
         crate::routes::containers_list::list_containers_handler,
         crate::routes::container_stop::stop_container_handler,
         crate::routes::container_create::create_container_handler,
-        crate::routes::exec::exec_once_handler
+        crate::routes::exec::exec_once_handler,
+        crate::routes::write_file::write_file_handler,
     )
 )]
 struct ApiDoc;
@@ -57,6 +59,7 @@ pub(crate) fn build_router(app: Arc<AppState>) -> Router {
         .route("/containers/:id/stop", post(stop_container_handler))
         .route("/containers/:id/exec", post(exec_once_handler))
         .route("/containers/:id/exec/ws", get(exec_ws_handler))
+        .route("/containers/:id/write-file", post(write_file_handler))
         .route("/events", get(events_ws))
         .layer(limiter)
         .with_state(app)

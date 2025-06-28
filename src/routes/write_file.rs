@@ -8,6 +8,7 @@ use axum::{
 use bollard::{body_full, query_parameters::UploadToContainerOptions, Docker};
 use serde::{Deserialize, Serialize};
 use tar::{Builder, Header};
+use utoipa::ToSchema;
 
 use crate::{
     routes::exec::{exec_once_handler, ExecRequest},
@@ -17,7 +18,7 @@ use crate::{
 /// ─────────────────────────────────────────────────────────────
 /// Request/response DTOs
 /// ─────────────────────────────────────────────────────────────
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct WriteFileRequest {
     /// **Absolute** path inside the target container
     pub path: String,
@@ -27,16 +28,30 @@ pub struct WriteFileRequest {
     pub owner: Option<String>,
     /// Optional mode string, e.g. "0644"
     pub mode: Option<String>,
+    /// If true, overwrite existing file at the given path
+    pub overwrite: Option<bool>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct WriteFileResponse {
     pub status: &'static str,
 }
 
-/// ─────────────────────────────────────────────────────────────
-/// Main handler
-/// ─────────────────────────────────────────────────────────────
+#[utoipa::path(
+    post,
+    path = "/containers/{id}/write-file",
+    request_body = WriteFileRequest,
+    responses(
+        (status = 200, description = "File written successfully", body = WriteFileResponse),
+        (status = 409, description = "File exists and overwrite is false"),
+        (status = 400, description = "Invalid request"),
+        (status = 500, description = "Internal error"),
+    ),
+    params(
+        ("id" = String, Path, description = "Container ID or name")
+    ),
+    tag = "containers"
+)]
 pub async fn write_file_handler(
     State(state): State<Arc<AppState>>,
     AxumPath(container_id): AxumPath<String>,
@@ -48,6 +63,27 @@ pub async fn write_file_handler(
             StatusCode::BAD_REQUEST,
             "path must be absolute (begin with '/')".into(),
         ));
+    }
+
+    if payload.overwrite == Some(false) {
+        let exists_req = ExecRequest {
+            cmd: vec!["test".into(), "-e".into(), payload.path.clone()],
+            user: Some("root".into()),
+        };
+
+        let exists_result = exec_once_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(container_id.clone()),
+            Json(exists_req),
+        )
+        .await;
+
+        if exists_result.is_ok() {
+            return Err((
+                StatusCode::CONFLICT,
+                format!("Refusing to overwrite existing file at {}", payload.path),
+            ));
+        }
     }
 
     // 1) Build an in-memory tar that contains exactly one file.
