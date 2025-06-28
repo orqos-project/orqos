@@ -97,13 +97,6 @@ pub async fn exec_once_handler(
     validate_container_id(&container).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     validate_command(&req.cmd).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
-    if req.cmd.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Command cannot be empty".to_string(),
-        ));
-    }
-
     // 1. Create the exec instance
     let exec = state
         .docker
