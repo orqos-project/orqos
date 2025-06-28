@@ -155,8 +155,8 @@ pub async fn exec_once_handler(
 /// ------------------------
 /// When a client connects to `/containers/:id/exec/ws`, the server streams
 /// stdout and stderr output from the attached `docker exec` session as
-/// raw binary WebSocket frames. These frames are unstructured and sent
-/// as-is from Docker's output.
+/// structured JSON text messages in the format:
+/// `{"stream": "stdout|stderr", "data": "<output>"}`
 ///
 /// When the process terminates, the server sends a **final text message**
 /// in the following format:
@@ -168,11 +168,10 @@ pub async fn exec_once_handler(
 /// completion and trigger any teardown or UI updates accordingly.
 ///
 /// Example:
-///     Binary frame: b"hello world\\n"
-///     Text frame:   "__exit_code:0"
+///     Text frame: {"stream": "stdout", "data": "hello world\n"}
+///     Text frame: "__exit_code:0"
 ///
 /// Note: The default exit code fallback is `-1` if Docker provides no value.
-
 pub async fn exec_ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
