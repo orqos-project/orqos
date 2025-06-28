@@ -65,6 +65,14 @@ pub async fn write_file_handler(
         ));
     }
 
+    // Validate against path traversal
+    if payload.path.contains("/../") || payload.path.contains("/./") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "path contains invalid sequences".into(),
+        ));
+    }
+
     if payload.overwrite == Some(false) {
         let exists_req = ExecRequest {
             cmd: vec!["test".into(), "-e".into(), payload.path.clone()],
