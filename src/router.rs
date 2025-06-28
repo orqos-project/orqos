@@ -7,12 +7,13 @@ use axum::{response::IntoResponse, routing::get, Router};
 use utoipa::OpenApi;
 
 use crate::routes::container_create::create_container;
+use crate::routes::container_stop::stop_container_handler;
 pub use crate::routes::containers_list::list_containers;
 use crate::state::AppState;
 
 #[derive(OpenApi)]
 #[openapi(
-    info(description = "My Api description"),
+    info(description = "Orqos Api"),
     paths(crate::routes::containers_list::list_containers)
 )]
 struct ApiDoc;
@@ -31,6 +32,7 @@ pub(crate) fn build_router(app: Arc<AppState>) -> Router {
     Router::new()
         .route("/containers", get(list_containers))
         .route("/containers", post(create_container))
+        .route("/containers/:id/stop", post(stop_container_handler))
         .route("/events", get(events_ws))
         .with_state(app)
         .merge(
