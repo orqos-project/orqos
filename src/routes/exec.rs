@@ -24,39 +24,71 @@ use bollard::{
 };
 use futures::SinkExt;
 use futures_util::StreamExt;
+use lazy_static::lazy_static;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
+use tower_http::limit::RateLimitLayer;
 use tracing::error;
+use utoipa::ToSchema;
 
 use crate::state::AppState;
 
 // ---------------------------------------------------------------------------
 // JSON payloads
 // ---------------------------------------------------------------------------
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct ExecRequest {
-    /// Command vector, e.g. ["ls","-la"]
+    #[schema(example = json!(["ls", "-la", "/data"]))]
     pub cmd: Vec<String>,
 
-    /// Optional user – UID, UID:GID, or username
     #[serde(default)]
+    #[schema(example = "1000:1000")]
     pub user: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ExecResponse {
     pub stdout: String,
     pub stderr: String,
     pub exit_code: i64,
 }
 
-// ---------------------------------------------------------------------------
-// REST endpoint – run once, return collected output
-// ---------------------------------------------------------------------------
+lazy_static! {
+    static ref CONTAINER_ID_RE: Regex = Regex::new(r"^[a-zA-Z0-9_.-]{1,64}$").unwrap();
+}
+
+fn validate_container_id(id: &str) -> Result<(), &'static str> {
+    if CONTAINER_ID_RE.is_match(id) {
+        Ok(())
+    } else {
+        Err("Invalid container ID format")
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/containers/{id}/exec",
+    request_body = ExecRequest,
+    responses(
+        (status = 200, description = "Command executed successfully", body = ExecResponse),
+        (status = 500, description = "Internal server error"),
+    ),
+    params(
+        ("id" = String, Path, description = "ID or name of the container"),
+    ),
+    tag = "Containers",
+    operation_id = "exec_in_container",
+    summary = "Execute a command in a running container",
+    description = "Creates a one-time `docker exec` session inside the specified container and returns the captured stdout/stderr output and exit code."
+)]
 pub async fn exec_once_handler(
     State(state): State<Arc<AppState>>,
     Path(container): Path<String>,
     Json(req): Json<ExecRequest>,
 ) -> Result<Json<ExecResponse>, (StatusCode, String)> {
+    validate_container_id(&container).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
     // 1. Create the exec instance
     let exec = state
         .docker
@@ -107,19 +139,40 @@ pub async fn exec_once_handler(
     Ok(Json(ExecResponse {
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
-        exit_code: inspect.exit_code.unwrap_or_default(),
+        exit_code: inspect.exit_code.unwrap_or(-1),
     }))
 }
 
-// ---------------------------------------------------------------------------
-// WebSocket endpoint – live streaming
-// ---------------------------------------------------------------------------
+/// WebSocket Exec Protocol:
+/// ------------------------
+/// When a client connects to `/containers/:id/exec/ws`, the server streams
+/// stdout and stderr output from the attached `docker exec` session as
+/// raw binary WebSocket frames. These frames are unstructured and sent
+/// as-is from Docker's output.
+///
+/// When the process terminates, the server sends a **final text message**
+/// in the following format:
+///
+///     __exit_code:<number>
+///
+/// This sentinel indicates that the stream has ended and provides the exit
+/// status of the command. Clients should monitor for this message to detect
+/// completion and trigger any teardown or UI updates accordingly.
+///
+/// Example:
+///     Binary frame: b"hello world\\n"
+///     Text frame:   "__exit_code:0"
+///
+/// Note: The default exit code fallback is `-1` if Docker provides no value.
+
 pub async fn exec_ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
     Path(container): Path<String>,
     Query(req): Query<ExecRequest>,
 ) -> impl IntoResponse {
+    validate_container_id(&container).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
     ws.on_upgrade(move |socket| stream_exec_over_ws(socket, state.docker.clone(), container, req))
 }
 
@@ -181,6 +234,8 @@ async fn stream_exec_over_ws(
 
     // 4. Final exit code sentinel
     if let Ok(inspect) = docker.inspect_exec(&exec.id).await {
+        // Send final exit code as a specially formatted text message.
+        // Clients should detect this and treat it as the end of stream.
         let msg = format!("__exit_code:{}", inspect.exit_code.unwrap_or(-1));
         let _ = socket.send(Message::Text(msg.into())).await;
     }
