@@ -53,7 +53,7 @@ pub struct ReadFileRequest {
 
 /// Pull a single file out of a container.
 ///
-/// `POST /containers/{id}/read_file`  
+/// `POST /containers/{id}/read-file`  
 /// Body: `{ "path": "/absolute/path" }`  
 /// Response: `200` *application/octet-stream*
 #[utoipa::path(
@@ -77,28 +77,12 @@ pub async fn read_file_handler(
     let base = allowed_base();
     let target: PathBuf =
         clean_path(&req.path).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    let target_as_str = target
-        .to_str()
-        .ok_or_else(|| {
-            (
-                StatusCode::BAD_REQUEST,
-                "Invalid UTF-8 path in request".into(),
-            )
-        })?
-        .to_string();
 
     // prefix check (string compare is fine – both are absolute & normalised)
     if !target.starts_with(&base) {
         return Err((
             StatusCode::FORBIDDEN,
-            format!("path outside allowed base ({})", base.display()),
-        ));
-    }
-
-    if target_as_str.contains("/../") || target_as_str.contains("/./") {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "path contains invalid sequences".into(),
+            format!("path outside allowed base directory"),
         ));
     }
 
@@ -160,6 +144,13 @@ pub async fn read_file_handler(
 
     if file.header().entry_type() == EntryType::Symlink {
         return Err((StatusCode::FORBIDDEN, "symlinks not allowed".into()));
+    }
+
+    if entries.next().is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "path appears to be a directory".into(),
+        ));
     }
 
     let mut content = Vec::new();
