@@ -20,7 +20,9 @@ use crate::state::AppState;
     info(description = "Orqos Api"),
     paths(
         crate::routes::containers_list::list_containers_handler,
-        crate::routes::container_stop::stop_container_handler
+        crate::routes::container_stop::stop_container_handler,
+        crate::routes::container_create::create_container_handler,
+        crate::routes::exec::exec_once_handler
     )
 )]
 struct ApiDoc;

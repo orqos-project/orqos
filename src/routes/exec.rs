@@ -27,8 +27,6 @@ use futures_util::StreamExt;
 use lazy_static::lazy_static;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
-use tower_http::limit::RateLimitLayer;
 use tracing::error;
 use utoipa::ToSchema;
 
@@ -66,6 +64,14 @@ fn validate_container_id(id: &str) -> Result<(), &'static str> {
     }
 }
 
+fn validate_command(cmd: &[String]) -> Result<(), &'static str> {
+    if cmd.is_empty() {
+        return Err("Command cannot be empty");
+    }
+    // Add any other policy checks you need (black‑list, length, etc.)
+    Ok(())
+}
+
 #[utoipa::path(
     post,
     path = "/containers/{id}/exec",
@@ -88,6 +94,14 @@ pub async fn exec_once_handler(
     Json(req): Json<ExecRequest>,
 ) -> Result<Json<ExecResponse>, (StatusCode, String)> {
     validate_container_id(&container).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    validate_command(&req.cmd).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    if req.cmd.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Command cannot be empty".to_string(),
+        ));
+    }
 
     // 1. Create the exec instance
     let exec = state
@@ -171,7 +185,15 @@ pub async fn exec_ws_handler(
     Path(container): Path<String>,
     Query(req): Query<ExecRequest>,
 ) -> impl IntoResponse {
-    validate_container_id(&container).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    // Validate container ID
+    if let Err(e) = validate_container_id(&container) {
+        return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+
+    // Validate command vector
+    if let Err(e) = validate_command(&req.cmd) {
+        return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
 
     ws.on_upgrade(move |socket| stream_exec_over_ws(socket, state.docker.clone(), container, req))
 }
