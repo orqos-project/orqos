@@ -23,6 +23,10 @@ pub struct WriteFileRequest {
     pub path: String,
     /// Raw UTF-8 file contents (no base64 needed)
     pub content: String,
+    /// Optional owner string, e.g. "devuser:devuser"
+    pub owner: Option<String>,
+    /// Optional mode string, e.g. "0644"
+    pub mode: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -105,24 +109,34 @@ pub async fn write_file_handler(
     //    (we wrap the extractors by hand so we can call it like a normal function)
     use axum::extract::{Path as AxPath, State as AxState};
 
-    // chmod/chown are root-only ⇒ run as "root"
-    for cmd in [
-        vec!["chown", "devuser:devuser", &payload.path],
-        vec!["chmod", "0644", &payload.path],
-    ] {
+    if let Some(owner) = &payload.owner {
         let exec_req = ExecRequest {
-            cmd: cmd.iter().map(|s| s.to_string()).collect(),
+            cmd: vec!["chown".into(), owner.clone(), payload.path.clone()],
             user: Some("root".into()),
         };
 
-        // Propagate any (status, msg) pair from exec_once_handler if it fails
         let _ = exec_once_handler(
             AxState(state.clone()),
             AxPath(container_id.clone()),
             Json(exec_req),
         )
         .await
-        .map_err(|(sc, msg)| (sc, format!("exec {:?} failed: {msg}", cmd)))?;
+        .map_err(|(sc, msg)| (sc, format!("exec chown failed: {msg}")))?;
+    }
+
+    if let Some(mode) = &payload.mode {
+        let exec_req = ExecRequest {
+            cmd: vec!["chmod".into(), mode.clone(), payload.path.clone()],
+            user: Some("root".into()),
+        };
+
+        let _ = exec_once_handler(
+            AxState(state.clone()),
+            AxPath(container_id.clone()),
+            Json(exec_req),
+        )
+        .await
+        .map_err(|(sc, msg)| (sc, format!("exec chmod failed: {msg}")))?;
     }
 
     Ok(Json(WriteFileResponse { status: "ok" }))
