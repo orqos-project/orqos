@@ -27,6 +27,7 @@ use futures_util::StreamExt;
 use lazy_static::lazy_static;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tracing::error;
 use utoipa::ToSchema;
 
@@ -219,7 +220,7 @@ async fn stream_exec_over_ws(
         .await
     else {
         let _ = socket
-            .send(Message::Text("error: cannot create exec".into()))
+            .send(json!({ "error": "cannot create exec" }).to_string().into())
             .await;
         return;
     };
@@ -238,10 +239,26 @@ async fn stream_exec_over_ws(
     // 3. Forward frames
     while let Some(frame) = output.next().await {
         match frame {
-            Ok(LogOutput::StdOut { message }) | Ok(LogOutput::StdErr { message }) => {
-                // to client
-                if socket.send(Message::Binary(message.clone())).await.is_err() {
-                    break; // client closed
+            Ok(LogOutput::StdOut { message }) => {
+                let payload =
+                    json!({ "stream": "stdout", "data": String::from_utf8_lossy(&message) });
+                if socket
+                    .send(Message::Text(payload.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Ok(LogOutput::StdErr { message }) => {
+                let payload =
+                    json!({ "stream": "stderr", "data": String::from_utf8_lossy(&message) });
+                if socket
+                    .send(Message::Text(payload.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
                 }
             }
             Err(e) => {
