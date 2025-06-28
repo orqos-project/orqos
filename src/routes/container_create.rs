@@ -11,10 +11,11 @@ use bollard::{
 use rand::{rng, Rng};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
+use utoipa::ToSchema;
 
 use crate::state::AppState;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct ContainerCreate {
     pub name: String,
     pub image: String,
@@ -27,19 +28,19 @@ pub struct ContainerCreate {
     pub volumes: Option<Vec<VolumeMap>>, // [{source:"/host",target:"/data",ro:false}]
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct PortMap {
     pub container: u16,
     pub host: Option<u16>,
 }
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct VolumeMap {
     pub source: String,
     pub target: String,
     pub ro: Option<bool>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ContainerInfo {
     pub name: String,
     pub id: String,
@@ -82,7 +83,19 @@ fn parse_bytes(s: &str) -> u64 {
     }
 }
 
-pub(crate) async fn create_container(
+#[utoipa::path(
+    post,
+    path = "/containers",
+    request_body = ContainerCreate,
+    responses(
+        (status = 200, description = "Container created", body = ContainerInfo),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "Containers",
+    summary = "Create and start a new Docker container",
+    operation_id = "createContainer"
+)]
+pub(crate) async fn create_container_handler(
     State(app): State<Arc<AppState>>,
     Json(req): Json<ContainerCreate>,
 ) -> Result<Json<ContainerInfo>, (StatusCode, String)> {
