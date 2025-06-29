@@ -62,6 +62,6 @@ async fn stop_container(
 ) -> Result<(), BollardError> {
     let t_i32 = t.map(|v| v as i32);
     docker
-        .stop_container(id, Some(StopContainerOptions { t: t_i32, signal })) // 5-second grace
+        .stop_container(id, Some(StopContainerOptions { t: t_i32, signal }))
         .await
 }
