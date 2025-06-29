@@ -3,6 +3,7 @@ pub mod router;
 pub mod routes;
 pub mod state;
 
+use std::env;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -45,8 +46,9 @@ async fn main() -> Result<()> {
     });
     let router = build_router(app_state);
 
-    let listener = TcpListener::bind("0.0.0.0:3000").await?;
-    tracing::info!("Listening on 0.0.0.0:3000");
+    let bind_addr = env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".into());
+    let listener = TcpListener::bind(&bind_addr).await?;
+    tracing::info!("Listening on {}", bind_addr);
 
     let shutdown_signal = async {
         if let Err(e) = signal::ctrl_c().await {
