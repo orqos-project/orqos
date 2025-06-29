@@ -28,7 +28,8 @@ pub struct StopContainerRequest {
         (status = 204, description = "Container stopped successfully"),
         (status = 404, description = "Container not found"),
         (status = 500, description = "Internal server error")
-    )
+    ),
+    tag = "Containers",
 )]
 pub async fn stop_container_handler(
     State(state): State<Arc<AppState>>,

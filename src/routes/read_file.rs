@@ -67,7 +67,8 @@ pub struct ReadFileRequest {
         (status = 200, description = "Raw file bytes", content_type = "application/octet-stream"),
         (status = 404, description = "File not found"),
         (status = 500, description = "Docker or server error", body = String)
-    )
+    ),
+    tag = "Containers",
 )]
 pub async fn read_file_handler(
     State(state): State<Arc<AppState>>,

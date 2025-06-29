@@ -50,7 +50,7 @@ pub struct WriteFileResponse {
     params(
         ("id" = String, Path, description = "Container ID or name")
     ),
-    tag = "containers"
+    tag = "Containers"
 )]
 pub async fn write_file_handler(
     State(state): State<Arc<AppState>>,

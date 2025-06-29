@@ -28,7 +28,8 @@ pub struct ContainerQuery {
     params(ContainerQuery),
     responses(
         (status = 200, body = Object)
-    )
+    ),
+    tag = "Containers",
 )]
 pub async fn list_containers_handler(
     State(app): State<Arc<AppState>>,

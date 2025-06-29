@@ -26,6 +26,7 @@ pub struct ContainerCreate {
     pub ports: Option<Vec<PortMap>>, // [{container: 8080, host: 0}]
     pub network: Option<String>,     // "rawpair-net" (defaults to "bridge")
     pub volumes: Option<Vec<VolumeMap>>, // [{source:"/host",target:"/data",ro:false}]
+    pub labels: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -86,7 +87,27 @@ fn parse_bytes(s: &str) -> u64 {
 #[utoipa::path(
     post,
     path = "/containers",
-    request_body = ContainerCreate,
+    request_body(
+        content = ContainerCreate,
+        description = "Payload to create a container",
+        content_type = "application/json",
+        example = json!({
+            "name": "my-app",
+            "image": "nginx:1.27",
+            "cpu": "1.5",
+            "memory": "1g",
+            "env": ["RUST_LOG=info"],
+            "labels": { "tier": "backend" },
+            "ports": [
+                { "container": 80, "host": 8080 },
+                { "container": 443 }
+            ],
+            "network": "my-network",
+            "volumes": [
+                { "source": "/host/data", "target": "/data", "ro": false }
+            ]
+        })
+    ),
     responses(
         (status = 200, description = "Container created", body = ContainerInfo),
         (status = 500, description = "Internal server error"),
@@ -155,6 +176,7 @@ pub(crate) async fn create_container_handler(
     let cfg = ContainerCreateBody {
         image: Some(req.image),
         env: req.env,
+        labels: req.labels.clone(),
         exposed_ports: if exposed.is_empty() {
             None
         } else {
