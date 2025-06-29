@@ -4,7 +4,6 @@ use bollard::{query_parameters::EventsOptionsBuilder, Docker};
 use futures_util::StreamExt;
 use serde_json::Value;
 use tokio::{spawn, sync::broadcast, task::JoinHandle, time::sleep};
-use tracing::{debug, warn};
 
 /// Spawns a background task that subscribes to Docker events and fan‑outs
 /// them through a [`broadcast::Sender`].
@@ -19,10 +18,11 @@ pub(crate) fn spawn_event_fanout(docker: Docker, tx: broadcast::Sender<Value>) -
     spawn(async move {
         let mut attempt: u32 = 0;
 
+        tracing::debug!("Starting Docker event fan-out task");
+
         loop {
             // If no one is listening, wait and re‑check.
             if tx.receiver_count() == 0 {
-                debug!(target = "event-fanout", "no receivers; sleeping");
                 sleep(Duration::from_secs(1)).await;
                 continue;
             }
@@ -30,7 +30,7 @@ pub(crate) fn spawn_event_fanout(docker: Docker, tx: broadcast::Sender<Value>) -
             // At least one receiver → subscribe
             let opts = EventsOptionsBuilder::new().build();
             attempt += 1;
-            debug!(target: "event-fanout", attempt, "subscribing to Docker events");
+            tracing::debug!(target: "event-fanout", attempt, "subscribing to Docker events");
 
             let mut stream = docker.events(Some(opts));
             let mut received_any = false;
@@ -44,16 +44,19 @@ pub(crate) fn spawn_event_fanout(docker: Docker, tx: broadcast::Sender<Value>) -
                             if let Err(err) = tx.send(js) {
                                 // If receiver count dropped to 0 mid‑flight, downgrade to debug.
                                 if tx.receiver_count() == 0 {
-                                    debug!(?err, "all receivers gone; dropping events");
+                                    tracing::debug!(?err, "all receivers gone; dropping events");
                                     break; // Exit loop; will park again.
                                 } else {
-                                    warn!(?err, "failed to deliver Docker event to receivers");
+                                    tracing::warn!(
+                                        ?err,
+                                        "failed to deliver Docker event to receivers"
+                                    );
                                 }
                             }
                         }
                     }
                     Err(err) => {
-                        warn!(?err, "Docker event stream error—will reconnect");
+                        tracing::warn!(?err, "Docker event stream error—will reconnect");
                         break;
                     }
                 }
@@ -63,7 +66,7 @@ pub(crate) fn spawn_event_fanout(docker: Docker, tx: broadcast::Sender<Value>) -
                 attempt = 0; // Stream was healthy → reset back‑off.
             }
 
-            debug!("Docker event stream closed—attempting to reconnect");
+            tracing::debug!("Docker event stream closed—attempting to reconnect");
             let backoff = Duration::from_secs(2u64.pow(attempt.min(5)));
             sleep(backoff).await;
         }

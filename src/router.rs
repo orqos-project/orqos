@@ -4,9 +4,6 @@ use axum::extract::ws::{Message, WebSocketUpgrade};
 use axum::extract::State;
 use axum::routing::post;
 use axum::{response::IntoResponse, routing::get, Router};
-use tower_governor::governor::GovernorConfigBuilder;
-use tower_governor::key_extractor::SmartIpKeyExtractor;
-use tower_governor::GovernorLayer;
 use utoipa::OpenApi;
 
 use crate::routes::container_create::create_container_handler;
@@ -42,19 +39,6 @@ async fn events_ws(State(app): State<Arc<AppState>>, ws: WebSocketUpgrade) -> im
 }
 
 pub(crate) fn build_router(app: Arc<AppState>) -> Router {
-    let governor_conf = Arc::new(
-        GovernorConfigBuilder::default()
-            .per_second(2)
-            .burst_size(5)
-            .key_extractor(SmartIpKeyExtractor) // uses client IP
-            .finish()
-            .expect("failed to build rate limiter config"),
-    );
-
-    let limiter = GovernorLayer {
-        config: governor_conf,
-    };
-
     Router::new()
         .route("/containers", get(list_containers_handler))
         .route("/containers", post(create_container_handler))
@@ -64,7 +48,6 @@ pub(crate) fn build_router(app: Arc<AppState>) -> Router {
         .route("/containers/{id}/write-file", post(write_file_handler))
         .route("/containers/{id}/read-file", post(read_file_handler))
         .route("/events", get(events_ws))
-        .layer(limiter)
         .with_state(app)
         .merge(
             utoipa_swagger_ui::SwaggerUi::new("/swagger")

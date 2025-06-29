@@ -9,11 +9,16 @@ use std::sync::Arc;
 
 use crate::state::AppState;
 
-#[derive(Deserialize, Default, utoipa::IntoParams)]
+#[derive(Debug, Deserialize, Default, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ContainerQuery {
+    #[param(required = false)]
     status: Option<String>, // status=running,exited
-    label: Option<String>,  // label=k=v,label=x=y
-    name: Option<String>,   // name=foo,name=bar
+    #[param(required = false)]
+    label: Option<String>, // label=k=v,label=x=y
+    #[param(required = false)]
+    name: Option<String>, // name=foo,name=bar
+    #[param(required = false)]
     all: Option<bool>,
 }
 
@@ -58,6 +63,8 @@ pub async fn list_containers_handler(
         .all(q.all.unwrap_or(false))
         .filters(&filters)
         .build();
+
+    tracing::debug!(?opts, "Listing containers with options");
 
     app.docker
         .list_containers(Some(opts))
