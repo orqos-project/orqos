@@ -22,7 +22,7 @@ pub struct RemoveContainerRequest {
     params(
         ("id" = String, Path, description = "Container ID or name")
     ),
-    request_body(content = RemoveContainerRequest, description = "Stop options", content_type = "application/json"),
+    request_body(content = RemoveContainerRequest, description = "Options", content_type = "application/json"),
     responses(
         (status = 204, description = "Container removed successfully"),
         (status = 404, description = "Container not found"),
@@ -47,7 +47,7 @@ pub async fn remove_container_handler(
             StatusCode::NOT_FOUND
         }
         Err(e) => {
-            tracing::error!("failed to stop container {container_id}: {e}");
+            tracing::error!("failed to remove container {container_id}: {e}");
             StatusCode::INTERNAL_SERVER_ERROR
         }
     }
