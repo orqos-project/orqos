@@ -86,6 +86,7 @@ impl MetricRegistry {
                 .rev()
                 .take_while(|&&(ts, _)| now.duration_since(ts) <= window)
                 .map(|&(_, v)| v)
+                .filter(|v| !v.is_nan())
                 .max_by(|a, b| a.partial_cmp(b).unwrap())
         })
     }

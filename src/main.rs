@@ -5,6 +5,7 @@ pub mod router;
 pub mod routes;
 pub mod state;
 
+use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,6 +16,7 @@ use bollard::API_DEFAULT_VERSION;
 use tokio::net::TcpListener;
 use tokio::signal;
 use tokio::sync::broadcast;
+use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
@@ -23,6 +25,7 @@ use crate::metric_poller::poll_metrics_into_registry;
 use crate::metric_registry::MetricRegistry;
 use crate::router::build_router;
 use crate::state::AppState;
+use crate::state::CpuSnapshot;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -38,22 +41,24 @@ async fn main() -> Result<()> {
     };
     tracing::info!("Connected to Docker {:?}", docker.version().await?.version);
 
-    // 2. Broadcast channel (100-message ring buffer)
+    // Broadcast channel (100-message ring buffer)
     let (tx, _) = broadcast::channel(100);
 
-    // 3. Spawn fan-out
+    // Spawn fan-out
     let event_handle: JoinHandle<()> = spawn_event_fanout(docker.clone(), tx.clone());
 
     let metric_registry = MetricRegistry::default();
 
-    // 4. Serve HTTP
     let app_state = Arc::new(AppState {
         docker,
         events_tx: tx,
         metric_registry,
+        cpu_snapshots: RwLock::<HashMap<String, CpuSnapshot>>::default(),
     });
+
     let router = build_router(app_state.clone());
 
+    // Serve HTTP
     let bind_addr = env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".into());
     let listener = TcpListener::bind(&bind_addr).await?;
     tracing::info!("Listening on {}", bind_addr);
@@ -67,11 +72,18 @@ async fn main() -> Result<()> {
 
     let state_clone = app_state.clone();
 
-    tokio::spawn(async move {
+    // Spawn metric polling task
+    let metric_handle: JoinHandle<()> = tokio::spawn(async move {
         let interval = Duration::from_secs(5);
-
         loop {
-            poll_metrics_into_registry(state_clone.clone()).await;
+            if let Err(e) = tokio::time::timeout(
+                Duration::from_secs(30),
+                poll_metrics_into_registry(state_clone.clone()),
+            )
+            .await
+            {
+                warn!(?e, "Metric polling timed out or failed");
+            }
             tokio::time::sleep(interval).await;
         }
     });
@@ -80,10 +92,16 @@ async fn main() -> Result<()> {
         .with_graceful_shutdown(shutdown_signal)
         .await?;
 
-    // 6. Clean shutdown: stop event stream task
+    // Clean shutdown: stop event stream task
     event_handle.abort();
     if let Err(e) = event_handle.await {
         warn!(?e, "event fan‑out task aborted while shutting down");
+    }
+
+    // Stop metric polling task
+    metric_handle.abort();
+    if let Err(e) = metric_handle.await {
+        warn!(?e, "metric polling task aborted while shutting down");
     }
 
     info!("Orqos terminated cleanly");
