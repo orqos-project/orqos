@@ -42,11 +42,7 @@ pub async fn poll_metrics_into_registry(app_state: Arc<AppState>) {
                         continue;
                     };
                     let total = usage.total_usage.unwrap_or_default();
-                    let Some(percpu) = usage.percpu_usage else {
-                        tracing::debug!("Missing percpu_usage for container {}", id);
-                        continue;
-                    };
-                    let cores = percpu.len().max(1) as f64;
+                    let cores = cpu_stats.online_cpus.unwrap_or(1) as f64;
 
                     let mut snapshots = app_state.cpu_snapshots.write().await;
 
