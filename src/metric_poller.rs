@@ -29,20 +29,12 @@ pub async fn poll_metrics_into_registry(app_state: Arc<AppState>) {
 
             match stats_stream.next().await {
                 Some(Ok(s)) => {
-                    let Some(cpu_stats) = s.cpu_stats else {
-                        tracing::debug!("Missing cpu_stats for container {}", id);
-                        continue;
-                    };
-                    let Some(usage) = cpu_stats.cpu_usage else {
-                        tracing::debug!("Missing cpu_usage for container {}", id);
-                        continue;
-                    };
-                    let Some(sys) = cpu_stats.system_cpu_usage else {
-                        tracing::debug!("Missing system_cpu_usage for container {}", id);
-                        continue;
-                    };
-                    let total = usage.total_usage.unwrap_or_default();
-                    let cores = cpu_stats.online_cpus.unwrap_or(1) as f64;
+                    let cpu_stats = s.cpu_stats.as_ref();
+                    let usage = cpu_stats.and_then(|cs| cs.cpu_usage.as_ref());
+
+                    let total = usage.and_then(|cu| cu.total_usage).unwrap_or(0);
+                    let sys = cpu_stats.and_then(|cs| cs.system_cpu_usage).unwrap_or(0);
+                    let cores = cpu_stats.and_then(|cs| cs.online_cpus).unwrap_or(1) as f64;
 
                     let mut snapshots = app_state.cpu_snapshots.write().await;
 
@@ -56,8 +48,11 @@ pub async fn poll_metrics_into_registry(app_state: Arc<AppState>) {
                             let cpu_fraction = (cpu_delta as f64 / sys_delta as f64) * cores;
                             app_state.metric_registry.record_cpu(&id, cpu_fraction);
                         } else {
-                            tracing::debug!("Zero delta for container {}, skipping CPU calc", id);
+                            app_state.metric_registry.record_cpu(&id, 0.0);
                         }
+                    } else {
+                        // no previous snapshot — record zero for now
+                        app_state.metric_registry.record_cpu(&id, 0.0);
                     }
 
                     snapshots.insert(
@@ -68,19 +63,15 @@ pub async fn poll_metrics_into_registry(app_state: Arc<AppState>) {
                         },
                     );
 
-                    let Some(mem_stats) = s.memory_stats else {
-                        tracing::debug!("Missing memory_stats for container {}", id);
-                        continue;
-                    };
-                    let Some(mem_bytes) = mem_stats.usage else {
-                        tracing::debug!("Missing memory_stats.usage for container {}", id);
-                        continue;
-                    };
-                    app_state.metric_registry.record_mem(&id, mem_bytes);
+                    let mem = s.memory_stats.as_ref().and_then(|m| m.usage).unwrap_or(0);
+
+                    app_state.metric_registry.record_mem(&id, mem);
                 }
+
                 Some(Err(e)) => {
                     tracing::debug!("Failed to fetch stats for container {}: {}", id, e);
                 }
+
                 None => {
                     tracing::debug!("No stats returned for container {}", id);
                 }
