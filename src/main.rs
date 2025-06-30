@@ -1,10 +1,13 @@
 pub mod events;
+pub mod metric_poller;
+pub mod metric_registry;
 pub mod router;
 pub mod routes;
 pub mod state;
 
 use std::env;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use bollard::Docker;
@@ -16,6 +19,8 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::events::spawn_event_fanout;
+use crate::metric_poller::poll_metrics_into_registry;
+use crate::metric_registry::MetricRegistry;
 use crate::router::build_router;
 use crate::state::AppState;
 
@@ -39,12 +44,15 @@ async fn main() -> Result<()> {
     // 3. Spawn fan-out
     let event_handle: JoinHandle<()> = spawn_event_fanout(docker.clone(), tx.clone());
 
+    let metric_registry = MetricRegistry::default();
+
     // 4. Serve HTTP
     let app_state = Arc::new(AppState {
         docker,
         events_tx: tx,
+        metric_registry,
     });
-    let router = build_router(app_state);
+    let router = build_router(app_state.clone());
 
     let bind_addr = env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".into());
     let listener = TcpListener::bind(&bind_addr).await?;
@@ -56,6 +64,17 @@ async fn main() -> Result<()> {
         }
         info!("shutdown signal received - closing HTTP server");
     };
+
+    let state_clone = app_state.clone();
+
+    tokio::spawn(async move {
+        let interval = Duration::from_secs(5);
+
+        loop {
+            poll_metrics_into_registry(state_clone.clone()).await;
+            tokio::time::sleep(interval).await;
+        }
+    });
 
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal)
