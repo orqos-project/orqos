@@ -1,15 +1,14 @@
 use std::sync::Arc;
 
-use axum::extract::ws::{Message, WebSocketUpgrade};
-use axum::extract::State;
 use axum::routing::post;
-use axum::{response::IntoResponse, routing::get, Router};
+use axum::{routing::get, Router};
 use utoipa::OpenApi;
 
 use crate::routes::container_create::create_container_handler;
 use crate::routes::container_remove::remove_container_handler;
 use crate::routes::container_stop::stop_container_handler;
 pub use crate::routes::containers_list::list_containers_handler;
+use crate::routes::events_ws::events_ws;
 use crate::routes::exec::{exec_once_handler, exec_ws_handler};
 use crate::routes::metrics::metrics_handler;
 use crate::routes::read_file::read_file_handler;
@@ -27,19 +26,10 @@ use crate::state::AppState;
         crate::routes::exec::exec_once_handler,
         crate::routes::write_file::write_file_handler,
         crate::routes::read_file::read_file_handler,
+        crate::routes::events_ws::events_ws
     )
 )]
 struct ApiDoc;
-
-async fn events_ws(State(app): State<Arc<AppState>>, ws: WebSocketUpgrade) -> impl IntoResponse {
-    ws.on_upgrade(move |mut socket| async move {
-        let mut rx = app.events_tx.subscribe();
-        while let Ok(ev) = rx.recv().await {
-            // Ignore errors if client closed
-            let _ = socket.send(Message::Text(ev.to_string().into())).await;
-        }
-    })
-}
 
 pub(crate) fn build_router(app: Arc<AppState>) -> Router {
     Router::new()
@@ -52,7 +42,7 @@ pub(crate) fn build_router(app: Arc<AppState>) -> Router {
         .route("/containers/{id}/write-file", post(write_file_handler))
         .route("/containers/{id}/read-file", post(read_file_handler))
         .route("/metrics", get(metrics_handler))
-        .route("/events", get(events_ws))
+        .route("/events/ws", get(events_ws))
         .with_state(app)
         .merge(
             utoipa_swagger_ui::SwaggerUi::new("/swagger")

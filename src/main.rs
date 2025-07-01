@@ -1,8 +1,8 @@
-pub mod events;
 pub mod metric_poller;
 pub mod metric_registry;
 pub mod router;
 pub mod routes;
+pub mod spawn_docker_events_fanout;
 pub mod state;
 
 use std::collections::HashMap;
@@ -20,10 +20,10 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use crate::events::spawn_event_fanout;
 use crate::metric_poller::poll_metrics_into_registry;
 use crate::metric_registry::MetricRegistry;
 use crate::router::build_router;
+use crate::spawn_docker_events_fanout::spawn_event_fanout;
 use crate::state::AppState;
 use crate::state::CpuSnapshot;
 
@@ -95,7 +95,7 @@ async fn main() -> Result<()> {
     // Clean shutdown: stop event stream task
     event_handle.abort();
     if let Err(e) = event_handle.await {
-        warn!(?e, "event fan‑out task aborted while shutting down");
+        warn!(?e, "event fan-out task aborted while shutting down");
     }
 
     // Stop metric polling task
