@@ -6,4 +6,5 @@ pub mod events_ws;
 pub mod exec;
 pub mod metrics;
 pub mod read_file;
+pub mod stats_ws;
 pub mod write_file;

@@ -14,6 +14,7 @@ pub struct CpuSnapshot {
 pub struct AppState {
     pub(crate) docker: Docker,
     pub(crate) events_tx: broadcast::Sender<serde_json::Value>,
+    pub(crate) stats_tx: broadcast::Sender<serde_json::Value>,
     pub(crate) metric_registry: MetricRegistry,
     pub(crate) cpu_snapshots: RwLock<HashMap<String, CpuSnapshot>>,
 }

@@ -4,6 +4,7 @@ pub mod router;
 pub mod routes;
 pub mod spawn_docker_events_fanout;
 pub mod state;
+pub mod stats;
 
 use std::collections::HashMap;
 use std::env;
@@ -26,6 +27,7 @@ use crate::router::build_router;
 use crate::spawn_docker_events_fanout::spawn_event_fanout;
 use crate::state::AppState;
 use crate::state::CpuSnapshot;
+use crate::stats::push_stats_to_ws_clients;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -41,17 +43,21 @@ async fn main() -> Result<()> {
     };
     tracing::info!("Connected to Docker {:?}", docker.version().await?.version);
 
-    // Broadcast channel (100-message ring buffer)
-    let (tx, _) = broadcast::channel(100);
+    // Events broadcast channel (100-message ring buffer)
+    let (events_tx, _) = broadcast::channel(100);
+
+    // Stats broadcast channel (100-message ring buffer)
+    let (stats_tx, _) = broadcast::channel(100);
 
     // Spawn fan-out
-    let event_handle: JoinHandle<()> = spawn_event_fanout(docker.clone(), tx.clone());
+    let event_handle: JoinHandle<()> = spawn_event_fanout(docker.clone(), events_tx.clone());
 
     let metric_registry = MetricRegistry::default();
 
     let app_state = Arc::new(AppState {
         docker,
-        events_tx: tx,
+        events_tx,
+        stats_tx,
         metric_registry,
         cpu_snapshots: RwLock::<HashMap<String, CpuSnapshot>>::default(),
     });
@@ -84,6 +90,9 @@ async fn main() -> Result<()> {
             {
                 warn!(?e, "Metric polling timed out or failed");
             }
+
+            push_stats_to_ws_clients(state_clone.clone());
+
             tokio::time::sleep(interval).await;
         }
     });
