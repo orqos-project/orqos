@@ -1,9 +1,9 @@
 use axum::{extract::State, response::IntoResponse};
 use std::{sync::Arc, time::Duration};
 
-use crate::state::AppState;
+use crate::docker_state::DockerAppState;
 
-pub async fn metrics_handler(State(app): State<Arc<AppState>>) -> impl IntoResponse {
+pub async fn metrics_handler(State(app): State<Arc<DockerAppState>>) -> impl IntoResponse {
     // Build a plain-text exposition:
     // rezn_cpu_usage_avg10{container="xyz"} 0.12
     // rezn_mem_usage_max10{container="xyz"} 8.0e+08

@@ -8,7 +8,7 @@ use serde::Deserialize;
 use std::sync::Arc;
 use utoipa::ToSchema;
 
-use crate::state::AppState;
+use crate::docker_state::DockerAppState;
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct RemoveContainerRequest {
@@ -31,7 +31,7 @@ pub struct RemoveContainerRequest {
     tag = "Containers",
 )]
 pub async fn remove_container_handler(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<DockerAppState>>,
     Path(container_id): Path<String>,
     maybe_json: Option<Json<RemoveContainerRequest>>,
 ) -> StatusCode {

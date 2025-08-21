@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::state::AppState;
+use crate::docker_state::DockerAppState;
 
 #[derive(Debug, Serialize)]
 struct Stats {
@@ -11,7 +11,7 @@ struct Stats {
     max_mem: Option<u64>,
 }
 
-pub fn push_stats_to_ws_clients(app: Arc<AppState>) {
+pub fn push_stats_to_ws_clients(app: Arc<DockerAppState>) {
     let mut container_stats: BTreeMap<String, Stats> = BTreeMap::default();
 
     for entry in app.metric_registry.cpu.iter() {

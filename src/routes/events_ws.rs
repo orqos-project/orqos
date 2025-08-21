@@ -5,7 +5,7 @@ use axum::{
     response::IntoResponse,
 };
 
-use crate::state::AppState;
+use crate::docker_state::DockerAppState;
 
 #[utoipa::path(
     get,
@@ -17,7 +17,7 @@ use crate::state::AppState;
     tag = "Streaming"
 )]
 pub async fn events_ws(
-    State(app): State<Arc<AppState>>,
+    State(app): State<Arc<DockerAppState>>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
     ws.on_upgrade(move |mut socket| async move {

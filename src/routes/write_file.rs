@@ -12,7 +12,7 @@ use utoipa::ToSchema;
 
 use crate::{
     routes::exec::{exec_once_handler, ExecRequest},
-    state::AppState,
+    docker_state::DockerAppState,
 };
 
 /// ─────────────────────────────────────────────────────────────
@@ -53,7 +53,7 @@ pub struct WriteFileResponse {
     tag = "Containers"
 )]
 pub async fn write_file_handler(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<DockerAppState>>,
     AxumPath(container_id): AxumPath<String>,
     Json(payload): Json<WriteFileRequest>,
 ) -> Result<Json<WriteFileResponse>, (StatusCode, String)> {

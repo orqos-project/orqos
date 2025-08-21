@@ -16,7 +16,7 @@ use std::{
 use tar::{Archive, EntryType};
 use utoipa::ToSchema;
 
-use crate::state::AppState;
+use crate::docker_state::DockerAppState;
 
 fn allowed_base() -> PathBuf {
     env::var_os("ORQOS_READ_BASE")
@@ -71,7 +71,7 @@ pub struct ReadFileRequest {
     tag = "Containers",
 )]
 pub async fn read_file_handler(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<DockerAppState>>,
     Path(container): Path<String>,
     Json(req): Json<ReadFileRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {

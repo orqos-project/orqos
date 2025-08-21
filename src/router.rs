@@ -14,7 +14,7 @@ use crate::routes::metrics::metrics_handler;
 use crate::routes::read_file::read_file_handler;
 use crate::routes::stats_ws::stats_ws;
 use crate::routes::write_file::write_file_handler;
-use crate::state::AppState;
+use crate::docker_state::DockerAppState;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -33,7 +33,7 @@ use crate::state::AppState;
 )]
 struct ApiDoc;
 
-pub(crate) fn build_router(app: Arc<AppState>) -> Router {
+pub(crate) fn build_router(app: Arc<DockerAppState>) -> Router {
     Router::new()
         .route("/containers", get(list_containers_handler))
         .route("/containers", post(create_container_handler))

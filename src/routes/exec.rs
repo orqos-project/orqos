@@ -31,7 +31,7 @@ use serde_json::json;
 use tracing::error;
 use utoipa::ToSchema;
 
-use crate::state::AppState;
+use crate::docker_state::DockerAppState;
 
 // ---------------------------------------------------------------------------
 // JSON payloads
@@ -90,7 +90,7 @@ fn validate_command(cmd: &[String]) -> Result<(), &'static str> {
     description = "Creates a one-time `docker exec` session inside the specified container and returns the captured stdout/stderr output and exit code."
 )]
 pub async fn exec_once_handler(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<DockerAppState>>,
     Path(container): Path<String>,
     Json(req): Json<ExecRequest>,
 ) -> Result<Json<ExecResponse>, (StatusCode, String)> {
@@ -174,7 +174,7 @@ pub async fn exec_once_handler(
 /// Note: The default exit code fallback is `-1` if Docker provides no value.
 pub async fn exec_ws_handler(
     ws: WebSocketUpgrade,
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<DockerAppState>>,
     Path(container): Path<String>,
     Query(req): Query<ExecRequest>,
 ) -> impl IntoResponse {

@@ -7,7 +7,7 @@ use bollard::models::ContainerSummary;
 use serde::Deserialize;
 use std::sync::Arc;
 
-use crate::state::AppState;
+use crate::docker_state::DockerAppState;
 
 #[derive(Debug, Deserialize, Default, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
@@ -32,7 +32,7 @@ pub struct ContainerQuery {
     tag = "Containers",
 )]
 pub async fn list_containers_handler(
-    State(app): State<Arc<AppState>>,
+    State(app): State<Arc<DockerAppState>>,
     Query(q): Query<ContainerQuery>,
 ) -> Result<Json<Vec<ContainerSummary>>, impl IntoResponse> {
     use bollard::query_parameters::ListContainersOptionsBuilder as Lcob;

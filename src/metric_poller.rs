@@ -3,9 +3,9 @@ use std::sync::Arc;
 use bollard::query_parameters::{ListContainersOptions, StatsOptions};
 use futures_util::StreamExt;
 
-use crate::state::{AppState, CpuSnapshot};
+use crate::docker_state::{DockerAppState, CpuSnapshot};
 
-pub async fn poll_metrics_into_registry(app_state: Arc<AppState>) {
+pub async fn poll_metrics_into_registry(app_state: Arc<DockerAppState>) {
     if let Ok(containers) = app_state
         .docker
         .list_containers(Some(ListContainersOptions {

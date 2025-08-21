@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
 use utoipa::ToSchema;
 
-use crate::state::AppState;
+use crate::docker_state::DockerAppState;
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct ContainerCreate {
@@ -117,7 +117,7 @@ fn parse_bytes(s: &str) -> u64 {
     operation_id = "createContainer"
 )]
 pub(crate) async fn create_container_handler(
-    State(app): State<Arc<AppState>>,
+    State(app): State<Arc<DockerAppState>>,
     Json(req): Json<ContainerCreate>,
 ) -> Result<Json<ContainerInfo>, (StatusCode, String)> {
     let docker: &Docker = &app.docker;

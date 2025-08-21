@@ -11,7 +11,7 @@ pub struct CpuSnapshot {
     pub system_usage: u64,
 }
 
-pub struct AppState {
+pub struct DockerAppState {
     pub(crate) docker: Docker,
     pub(crate) events_tx: broadcast::Sender<serde_json::Value>,
     pub(crate) stats_tx: broadcast::Sender<serde_json::Value>,
