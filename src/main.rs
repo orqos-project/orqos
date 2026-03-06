@@ -1,9 +1,12 @@
+pub mod app_state;
+pub mod docker_state;
+pub mod kube_state;
 pub mod metric_poller;
 pub mod metric_registry;
 pub mod router;
 pub mod routes;
 pub mod spawn_docker_events_fanout;
-pub mod docker_state;
+pub mod spawn_kube_events_fanout;
 pub mod stats;
 
 use std::collections::HashMap;
@@ -22,18 +25,19 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use crate::metric_poller::poll_metrics_into_registry;
+use crate::app_state::AppState;
+use crate::docker_state::{CpuSnapshot, DockerState};
+use crate::kube_state::KubeState;
+use crate::metric_poller::poll_docker_metrics;
 use crate::metric_registry::MetricRegistry;
 use crate::router::build_router;
 use crate::spawn_docker_events_fanout::spawn_event_fanout;
-use crate::docker_state::DockerAppState;
-use crate::docker_state::CpuSnapshot;
+use crate::spawn_kube_events_fanout::spawn_kube_event_fanout;
 use crate::stats::push_stats_to_ws_clients;
 
 async fn try_docker() -> Option<Docker> {
     let docker = Docker::connect_with_local_defaults()
         .or_else(|_| {
-            // fallback to Desktop or default Unix socket
             let sock = env::var("DOCKER_SOCKET")
                 .unwrap_or_else(|_| "/var/run/docker.sock".to_string());
             Docker::connect_with_unix(&sock, 30, API_DEFAULT_VERSION)
@@ -59,7 +63,7 @@ async fn main() -> Result<()> {
     if maybe_docker.is_none() && maybe_kube_client.is_none() {
         anyhow::bail!("Neither Docker nor Kubernetes is available");
     }
-    
+
     if let Some(docker) = &maybe_docker {
         tracing::info!(
             "Connected to Docker {:?}",
@@ -67,29 +71,47 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Events broadcast channel (100-message ring buffer)
-    let (events_tx, _) = broadcast::channel(100);
+    if maybe_kube_client.is_some() {
+        tracing::info!("Connected to Kubernetes");
+    }
 
-    // Stats broadcast channel (100-message ring buffer)
+    // Shared broadcast channels
+    let (events_tx, _) = broadcast::channel(100);
     let (stats_tx, _) = broadcast::channel(100);
 
-    // Maybe spawn fan-out for docker
-    let maybe_docker_event_handle: Option<JoinHandle<()>> = match &maybe_docker {
-        Some(docker) => Some(spawn_event_fanout(docker.clone(), events_tx.clone())),
-        None => None,
-    };
+    // Build optional backend states
+    let docker_state = maybe_docker.map(|docker| {
+        Arc::new(DockerState {
+            docker,
+            cpu_snapshots: RwLock::<HashMap<String, CpuSnapshot>>::default(),
+        })
+    });
+
+    let kube_state = maybe_kube_client.map(|client| {
+        let namespace = env::var("KUBE_NAMESPACE").unwrap_or_else(|_| "default".into());
+        Arc::new(KubeState { client, namespace })
+    });
+
+    // Conditionally spawn event fan-outs
+    let maybe_docker_event_handle: Option<JoinHandle<()>> = docker_state
+        .as_ref()
+        .map(|ds| spawn_event_fanout(ds.docker.clone(), events_tx.clone()));
+
+    let maybe_kube_event_handle: Option<JoinHandle<()>> = kube_state
+        .as_ref()
+        .map(|ks| spawn_kube_event_fanout(ks.client.clone(), events_tx.clone()));
 
     let metric_registry = MetricRegistry::default();
 
-    let docker_app_state = Arc::new(DockerAppState {
-        docker: maybe_docker.unwrap(),
+    let app_state = Arc::new(AppState {
+        docker: docker_state,
+        kube: kube_state,
         events_tx,
         stats_tx,
         metric_registry,
-        cpu_snapshots: RwLock::<HashMap<String, CpuSnapshot>>::default(),
     });
 
-    let router = build_router(docker_app_state.clone());
+    let router = build_router(app_state.clone());
 
     // Serve HTTP
     let bind_addr = env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".into());
@@ -103,22 +125,24 @@ async fn main() -> Result<()> {
         info!("shutdown signal received - closing HTTP server");
     };
 
-    let state_clone = docker_app_state.clone();
+    let state_clone = app_state.clone();
 
     // Spawn metric polling task
     let metric_handle: JoinHandle<()> = tokio::spawn(async move {
         let interval = Duration::from_secs(5);
         loop {
-            if let Err(e) = tokio::time::timeout(
-                Duration::from_secs(30),
-                poll_metrics_into_registry(state_clone.clone()),
-            )
-            .await
-            {
-                warn!(?e, "Metric polling timed out or failed");
+            if let Some(ref docker) = state_clone.docker {
+                if let Err(e) = tokio::time::timeout(
+                    Duration::from_secs(30),
+                    poll_docker_metrics(docker, &state_clone.metric_registry),
+                )
+                .await
+                {
+                    warn!(?e, "Docker metric polling timed out or failed");
+                }
             }
 
-            push_stats_to_ws_clients(state_clone.clone());
+            push_stats_to_ws_clients(&state_clone);
 
             tokio::time::sleep(interval).await;
         }
@@ -128,21 +152,21 @@ async fn main() -> Result<()> {
         .with_graceful_shutdown(shutdown_signal)
         .await?;
 
-    // Clean shutdown: stop event stream task
-    match maybe_docker_event_handle {
-        Some(event_handle) => {
-            event_handle.abort();
-
-            if let Err(e) = event_handle.await {
-                warn!(?e, "event fan-out task aborted while shutting down");
-            }
-        }
-        None => {
-            info!("No Docker event fan-out task to stop");
+    // Clean shutdown
+    if let Some(handle) = maybe_docker_event_handle {
+        handle.abort();
+        if let Err(e) = handle.await {
+            warn!(?e, "Docker event fan-out task aborted while shutting down");
         }
     }
 
-    // Stop metric polling task
+    if let Some(handle) = maybe_kube_event_handle {
+        handle.abort();
+        if let Err(e) = handle.await {
+            warn!(?e, "Kube event fan-out task aborted while shutting down");
+        }
+    }
+
     metric_handle.abort();
     if let Err(e) = metric_handle.await {
         warn!(?e, "metric polling task aborted while shutting down");

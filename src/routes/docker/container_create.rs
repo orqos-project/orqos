@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
 use utoipa::ToSchema;
 
-use crate::docker_state::DockerAppState;
+use crate::app_state::AppState;
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct ContainerCreate {
@@ -86,7 +86,7 @@ fn parse_bytes(s: &str) -> u64 {
 
 #[utoipa::path(
     post,
-    path = "/containers",
+    path = "/docker/containers",
     request_body(
         content = ContainerCreate,
         description = "Payload to create a container",
@@ -112,15 +112,15 @@ fn parse_bytes(s: &str) -> u64 {
         (status = 200, description = "Container created", body = ContainerInfo),
         (status = 500, description = "Internal server error"),
     ),
-    tag = "Containers",
+    tag = "Docker Containers",
     summary = "Create and start a new Docker container",
     operation_id = "createContainer"
 )]
 pub(crate) async fn create_container_handler(
-    State(app): State<Arc<DockerAppState>>,
+    State(app): State<Arc<AppState>>,
     Json(req): Json<ContainerCreate>,
 ) -> Result<Json<ContainerInfo>, (StatusCode, String)> {
-    let docker: &Docker = &app.docker;
+    let docker: &Docker = &app.docker.as_ref().unwrap().docker;
     let cname = req.name.clone();
 
     // Ports

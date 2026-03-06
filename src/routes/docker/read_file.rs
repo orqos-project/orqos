@@ -16,7 +16,7 @@ use std::{
 use tar::{Archive, EntryType};
 use utoipa::ToSchema;
 
-use crate::docker_state::DockerAppState;
+use crate::app_state::AppState;
 
 fn allowed_base() -> PathBuf {
     env::var_os("ORQOS_READ_BASE")
@@ -53,12 +53,12 @@ pub struct ReadFileRequest {
 
 /// Pull a single file out of a container.
 ///
-/// `POST /containers/{id}/read-file`  
-/// Body: `{ "path": "/absolute/path" }`  
+/// `POST /docker/containers/{id}/read-file`
+/// Body: `{ "path": "/absolute/path" }`
 /// Response: `200` *application/octet-stream*
 #[utoipa::path(
     post,
-    path = "/containers/{id}/read_file",
+    path = "/docker/containers/{id}/read-file",
     request_body = ReadFileRequest,
     params(
         ("id" = String, Path, description = "Container ID or name")
@@ -68,13 +68,14 @@ pub struct ReadFileRequest {
         (status = 404, description = "File not found"),
         (status = 500, description = "Docker or server error", body = String)
     ),
-    tag = "Containers",
+    tag = "Docker Containers",
 )]
 pub async fn read_file_handler(
-    State(state): State<Arc<DockerAppState>>,
+    State(state): State<Arc<AppState>>,
     Path(container): Path<String>,
     Json(req): Json<ReadFileRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let docker = &state.docker.as_ref().unwrap().docker;
     let base = allowed_base();
     let target: PathBuf =
         clean_path(&req.path).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -113,7 +114,7 @@ pub async fn read_file_handler(
     };
 
     // Await the API call
-    let mut stream = state.docker.download_from_container(&container, Some(opts));
+    let mut stream = docker.download_from_container(&container, Some(opts));
 
     // Slurp the tar stream into memory
     let mut tar_bytes = Vec::new();

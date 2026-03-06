@@ -20,7 +20,7 @@ chrono = "0.4"
 sled = "0.34"
 ctrlc = "3.4.7"
 bollard = "0.19.1"
-kube = { version = "1.1.0", features = ["runtime", "derive"] }
+kube = { version = "1.1.0", features = ["runtime", "derive", "ws"] }
 k8s-openapi = { version = "0.25.0", features = ["latest"] }
 tokio = { version = "1.45.1", features = [
     "rt-multi-thread",
@@ -40,3 +40,4 @@ tar = "0.4.44"
 flate2 = "1.1.2"
 infer = "0.19.0"
 dashmap = "6.1.0"
+tokio-util = { version = "0.7", features = ["io"] }

@@ -1,10 +1,3 @@
-pub mod container_create;
-pub mod container_remove;
-pub mod container_stop;
-pub mod containers_list;
-pub mod events_ws;
-pub mod exec;
-pub mod metrics;
-pub mod read_file;
-pub mod stats_ws;
-pub mod write_file;
+pub mod docker;
+pub mod kube;
+pub mod shared;

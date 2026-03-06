@@ -5,7 +5,7 @@ use axum::{
     response::IntoResponse,
 };
 
-use crate::docker_state::DockerAppState;
+use crate::app_state::AppState;
 
 #[utoipa::path(
     get,
@@ -16,11 +16,10 @@ use crate::docker_state::DockerAppState;
     ),
     tag = "Streaming"
 )]
-pub async fn stats_ws(State(app): State<Arc<DockerAppState>>, ws: WebSocketUpgrade) -> impl IntoResponse {
+pub async fn stats_ws(State(app): State<Arc<AppState>>, ws: WebSocketUpgrade) -> impl IntoResponse {
     ws.on_upgrade(move |mut socket| async move {
         let mut rx = app.stats_tx.subscribe();
         while let Ok(ev) = rx.recv().await {
-            // Ignore errors if client closed
             let _ = socket.send(Message::Text(ev.to_string().into())).await;
         }
     })

@@ -3,10 +3,11 @@ use std::sync::Arc;
 use bollard::query_parameters::{ListContainersOptions, StatsOptions};
 use futures_util::StreamExt;
 
-use crate::docker_state::{DockerAppState, CpuSnapshot};
+use crate::docker_state::{CpuSnapshot, DockerState};
+use crate::metric_registry::MetricRegistry;
 
-pub async fn poll_metrics_into_registry(app_state: Arc<DockerAppState>) {
-    if let Ok(containers) = app_state
+pub async fn poll_docker_metrics(docker_state: &Arc<DockerState>, metric_registry: &MetricRegistry) {
+    if let Ok(containers) = docker_state
         .docker
         .list_containers(Some(ListContainersOptions {
             all: false,
@@ -19,7 +20,7 @@ pub async fn poll_metrics_into_registry(app_state: Arc<DockerAppState>) {
         for c in containers {
             let id = c.id.unwrap_or_default();
 
-            let mut stats_stream = app_state.docker.stats(
+            let mut stats_stream = docker_state.docker.stats(
                 &id,
                 Some(StatsOptions {
                     stream: false,
@@ -36,7 +37,7 @@ pub async fn poll_metrics_into_registry(app_state: Arc<DockerAppState>) {
                     let sys = cpu_stats.and_then(|cs| cs.system_cpu_usage).unwrap_or(0);
                     let cores = cpu_stats.and_then(|cs| cs.online_cpus).unwrap_or(1) as f64;
 
-                    let mut snapshots = app_state.cpu_snapshots.write().await;
+                    let mut snapshots = docker_state.cpu_snapshots.write().await;
 
                     let prev = snapshots.get(&id);
 
@@ -46,13 +47,13 @@ pub async fn poll_metrics_into_registry(app_state: Arc<DockerAppState>) {
 
                         if sys_delta > 0 && cpu_delta > 0 {
                             let cpu_fraction = (cpu_delta as f64 / sys_delta as f64) * cores;
-                            app_state.metric_registry.record_cpu(&id, cpu_fraction);
+                            metric_registry.record_cpu(&id, cpu_fraction);
                         } else {
-                            app_state.metric_registry.record_cpu(&id, 0.0);
+                            metric_registry.record_cpu(&id, 0.0);
                         }
                     } else {
                         // no previous snapshot — record zero for now
-                        app_state.metric_registry.record_cpu(&id, 0.0);
+                        metric_registry.record_cpu(&id, 0.0);
                     }
 
                     snapshots.insert(
@@ -65,7 +66,7 @@ pub async fn poll_metrics_into_registry(app_state: Arc<DockerAppState>) {
 
                     let mem = s.memory_stats.as_ref().and_then(|m| m.usage).unwrap_or(0);
 
-                    app_state.metric_registry.record_mem(&id, mem);
+                    metric_registry.record_mem(&id, mem);
                 }
 
                 Some(Err(e)) => {

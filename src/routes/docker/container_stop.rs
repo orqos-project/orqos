@@ -9,7 +9,7 @@ use serde::Deserialize;
 use std::sync::Arc;
 use utoipa::ToSchema;
 
-use crate::docker_state::DockerAppState;
+use crate::app_state::AppState;
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct StopContainerRequest {
@@ -19,7 +19,7 @@ pub struct StopContainerRequest {
 
 #[utoipa::path(
     post,
-    path = "/containers/:id/stop",
+    path = "/docker/containers/{id}/stop",
     params(
         ("id" = String, Path, description = "Container ID or name")
     ),
@@ -29,20 +29,21 @@ pub struct StopContainerRequest {
         (status = 404, description = "Container not found"),
         (status = 500, description = "Internal server error")
     ),
-    tag = "Containers",
+    tag = "Docker Containers",
 )]
 pub async fn stop_container_handler(
-    State(state): State<Arc<DockerAppState>>,
+    State(state): State<Arc<AppState>>,
     Path(container_id): Path<String>,
     maybe_json: Option<Json<StopContainerRequest>>,
 ) -> StatusCode {
+    let docker = &state.docker.as_ref().unwrap().docker;
     let (t, signal) = maybe_json
         .map(|Json(req)| (req.t, req.signal))
         .unwrap_or((Some(5), None));
 
     let capped_t = t.map(|v| v.min(60));
 
-    match stop_container(&state.docker, &container_id, capped_t, signal).await {
+    match stop_container(docker, &container_id, capped_t, signal).await {
         Ok(()) => StatusCode::NO_CONTENT,
         Err(BollardError::DockerResponseServerError { status_code, .. }) if status_code == 404 => {
             StatusCode::NOT_FOUND

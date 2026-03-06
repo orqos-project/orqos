@@ -8,7 +8,7 @@ use serde::Deserialize;
 use std::sync::Arc;
 use utoipa::ToSchema;
 
-use crate::docker_state::DockerAppState;
+use crate::app_state::AppState;
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct RemoveContainerRequest {
@@ -18,7 +18,7 @@ pub struct RemoveContainerRequest {
 
 #[utoipa::path(
     post,
-    path = "/containers/:id/remove",
+    path = "/docker/containers/{id}/remove",
     params(
         ("id" = String, Path, description = "Container ID or name")
     ),
@@ -28,20 +28,21 @@ pub struct RemoveContainerRequest {
         (status = 404, description = "Container not found"),
         (status = 500, description = "Internal server error")
     ),
-    tag = "Containers",
+    tag = "Docker Containers",
 )]
 pub async fn remove_container_handler(
-    State(state): State<Arc<DockerAppState>>,
+    State(state): State<Arc<AppState>>,
     Path(container_id): Path<String>,
     maybe_json: Option<Json<RemoveContainerRequest>>,
 ) -> StatusCode {
+    let docker = &state.docker.as_ref().unwrap().docker;
     let (force, v) = maybe_json
         .map(|Json(req)| (req.force, req.v))
         .unwrap_or((None, None));
 
     tracing::debug!("Removing container {container_id} with force: {force:?}, v: {v:?}");
 
-    match remove_container(&state.docker, &container_id, force, v).await {
+    match remove_container(docker, &container_id, force, v).await {
         Ok(()) => StatusCode::NO_CONTENT,
         Err(BollardError::DockerResponseServerError { status_code, .. }) if status_code == 404 => {
             StatusCode::NOT_FOUND
