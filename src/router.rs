@@ -16,6 +16,8 @@ use crate::routes::kube::exec::{kube_exec_handler, kube_exec_ws_handler};
 use crate::routes::kube::pod_create::create_pod_handler;
 use crate::routes::kube::pod_delete::delete_pod_handler;
 use crate::routes::kube::pods_list::list_pods_handler;
+use crate::routes::kube::read_file::kube_read_file_handler;
+use crate::routes::kube::write_file::kube_write_file_handler;
 use crate::routes::shared::events_ws::events_ws;
 use crate::routes::shared::metrics::metrics_handler;
 use crate::routes::shared::stats_ws::stats_ws;
@@ -35,6 +37,8 @@ use crate::routes::shared::stats_ws::stats_ws;
         crate::routes::kube::pod_create::create_pod_handler,
         crate::routes::kube::pod_delete::delete_pod_handler,
         crate::routes::kube::exec::kube_exec_handler,
+        crate::routes::kube::read_file::kube_read_file_handler,
+        crate::routes::kube::write_file::kube_write_file_handler,
         crate::routes::shared::events_ws::events_ws,
         crate::routes::shared::stats_ws::stats_ws,
     )
@@ -74,7 +78,15 @@ pub(crate) fn build_router(app: Arc<AppState>) -> Router {
             .route("/kube/pods", post(create_pod_handler))
             .route("/kube/pods/{name}/delete", post(delete_pod_handler))
             .route("/kube/pods/{name}/exec", post(kube_exec_handler))
-            .route("/kube/pods/{name}/exec/ws", get(kube_exec_ws_handler));
+            .route("/kube/pods/{name}/exec/ws", get(kube_exec_ws_handler))
+            .route(
+                "/kube/pods/{name}/read-file",
+                post(kube_read_file_handler),
+            )
+            .route(
+                "/kube/pods/{name}/write-file",
+                post(kube_write_file_handler),
+            );
     }
 
     router

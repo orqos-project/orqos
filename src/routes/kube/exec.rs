@@ -19,6 +19,60 @@ use utoipa::{IntoParams, ToSchema};
 use crate::app_state::AppState;
 use crate::routes::docker::exec::ExecResponse;
 
+/// Execute a command in a pod and capture raw stdout bytes, stderr string, and exit code.
+pub(crate) async fn kube_exec_capture(
+    client: &KubeClient,
+    namespace: &str,
+    pod: &str,
+    container: Option<&str>,
+    cmd: Vec<String>,
+) -> Result<(Vec<u8>, String, i64), String> {
+    let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    let mut ap = AttachParams::default()
+        .stdout(true)
+        .stderr(true)
+        .stdin(false);
+    if let Some(c) = container {
+        ap = ap.container(c);
+    }
+
+    let mut attached = pods
+        .exec(pod, cmd, &ap)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+
+    if let Some(mut reader) = attached.stdout() {
+        reader
+            .read_to_end(&mut stdout_bytes)
+            .await
+            .map_err(|e| format!("stdout: {e}"))?;
+    }
+    if let Some(mut reader) = attached.stderr() {
+        reader
+            .read_to_end(&mut stderr_bytes)
+            .await
+            .map_err(|e| format!("stderr: {e}"))?;
+    }
+
+    let status = attached.take_status().unwrap().await;
+    let exit_code = status
+        .and_then(|s| {
+            s.status
+                .as_ref()
+                .and_then(|st| if st == "Success" { Some(0) } else { None })
+        })
+        .unwrap_or(-1);
+
+    Ok((
+        stdout_bytes,
+        String::from_utf8_lossy(&stderr_bytes).into_owned(),
+        exit_code,
+    ))
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct KubeExecRequest {
     #[schema(example = json!(["ls", "-la", "/"]))]
