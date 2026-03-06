@@ -12,7 +12,7 @@ use crate::routes::docker::containers_list::list_containers_handler;
 use crate::routes::docker::exec::{exec_once_handler, exec_ws_handler};
 use crate::routes::docker::read_file::read_file_handler;
 use crate::routes::docker::write_file::write_file_handler;
-use crate::routes::kube::exec::kube_exec_handler;
+use crate::routes::kube::exec::{kube_exec_handler, kube_exec_ws_handler};
 use crate::routes::kube::pod_create::create_pod_handler;
 use crate::routes::kube::pod_delete::delete_pod_handler;
 use crate::routes::kube::pods_list::list_pods_handler;
@@ -73,7 +73,8 @@ pub(crate) fn build_router(app: Arc<AppState>) -> Router {
             .route("/kube/pods", get(list_pods_handler))
             .route("/kube/pods", post(create_pod_handler))
             .route("/kube/pods/{name}/delete", post(delete_pod_handler))
-            .route("/kube/pods/{name}/exec", post(kube_exec_handler));
+            .route("/kube/pods/{name}/exec", post(kube_exec_handler))
+            .route("/kube/pods/{name}/exec/ws", get(kube_exec_ws_handler));
     }
 
     router

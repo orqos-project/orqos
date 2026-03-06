@@ -8,9 +8,9 @@
 - [x] Delete pod
 - [x] Exec in pod (buffered JSON)
 - [x] Kube pod event streaming (via shared /events/ws)
+- [x] Exec in pod (WebSocket streaming)
 
 ### Planned
-- [ ] Exec in pod (WebSocket streaming)
 - [ ] Read file from pod
 - [ ] Write file to pod
 - [ ] Kube metrics polling (Metrics Server API)
