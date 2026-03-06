@@ -5,12 +5,12 @@ use axum::{
     response::IntoResponse,
 };
 
-use crate::state::AppState;
+use crate::app_state::AppState;
 
 #[utoipa::path(
     get,
     path = "/events/ws",
-    description = "Exposes Docker events via WS",
+    description = "Exposes Docker and Kubernetes events via WS",
     responses(
         (status = 101, description = "WebSocket upgrade initiated")
     ),
@@ -23,7 +23,6 @@ pub async fn events_ws(
     ws.on_upgrade(move |mut socket| async move {
         let mut rx = app.events_tx.subscribe();
         while let Ok(ev) = rx.recv().await {
-            // Ignore errors if client closed
             let _ = socket.send(Message::Text(ev.to_string().into())).await;
         }
     })

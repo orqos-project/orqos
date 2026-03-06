@@ -10,14 +10,10 @@ use serde::{Deserialize, Serialize};
 use tar::{Builder, Header};
 use utoipa::ToSchema;
 
-use crate::{
-    routes::exec::{exec_once_handler, ExecRequest},
-    state::AppState,
-};
+use crate::app_state::AppState;
+use crate::routes::docker::exec::{exec_once_handler, ExecRequest};
 
-/// ─────────────────────────────────────────────────────────────
 /// Request/response DTOs
-/// ─────────────────────────────────────────────────────────────
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct WriteFileRequest {
     /// **Absolute** path inside the target container
@@ -39,7 +35,7 @@ pub struct WriteFileResponse {
 
 #[utoipa::path(
     post,
-    path = "/containers/{id}/write-file",
+    path = "/docker/containers/{id}/write-file",
     request_body = WriteFileRequest,
     responses(
         (status = 200, description = "File written successfully", body = WriteFileResponse),
@@ -50,7 +46,7 @@ pub struct WriteFileResponse {
     params(
         ("id" = String, Path, description = "Container ID or name")
     ),
-    tag = "Containers"
+    tag = "Docker Containers"
 )]
 pub async fn write_file_handler(
     State(state): State<Arc<AppState>>,
@@ -105,7 +101,7 @@ pub async fn write_file_handler(
         header.set_mode(0o644); // regular file 0644
         header.set_cksum();
 
-        // • paths inside the tar **must NOT be absolute** – strip the leading `/`
+        // paths inside the tar **must NOT be absolute** – strip the leading `/`
         let rel_path = &payload.path[1..];
 
         builder
@@ -135,7 +131,7 @@ pub async fn write_file_handler(
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| "/".to_owned());
 
-    let docker: &Docker = &state.docker;
+    let docker: &Docker = &state.docker.as_ref().unwrap().docker;
 
     docker
         .upload_to_container(
@@ -149,8 +145,7 @@ pub async fn write_file_handler(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("docker cp: {e}")))?;
 
-    // 3) Fix ownership and perms through the already-working exec_once_handler  ✅
-    //    (we wrap the extractors by hand so we can call it like a normal function)
+    // 3) Fix ownership and perms through exec_once_handler
     use axum::extract::{Path as AxPath, State as AxState};
 
     if let Some(owner) = &payload.owner {

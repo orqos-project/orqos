@@ -7,7 +7,7 @@ use bollard::models::ContainerSummary;
 use serde::Deserialize;
 use std::sync::Arc;
 
-use crate::state::AppState;
+use crate::app_state::AppState;
 
 #[derive(Debug, Deserialize, Default, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
@@ -24,12 +24,12 @@ pub struct ContainerQuery {
 
 #[utoipa::path(
     get,
-    path = "/containers",
+    path = "/docker/containers",
     params(ContainerQuery),
     responses(
         (status = 200, body = Object)
     ),
-    tag = "Containers",
+    tag = "Docker Containers",
 )]
 pub async fn list_containers_handler(
     State(app): State<Arc<AppState>>,
@@ -37,6 +37,8 @@ pub async fn list_containers_handler(
 ) -> Result<Json<Vec<ContainerSummary>>, impl IntoResponse> {
     use bollard::query_parameters::ListContainersOptionsBuilder as Lcob;
     use std::collections::HashMap;
+
+    let docker = &app.docker.as_ref().unwrap().docker;
 
     // Build Docker filter map dynamically
     let mut filters: HashMap<&str, Vec<String>> = HashMap::new();
@@ -67,7 +69,7 @@ pub async fn list_containers_handler(
 
     tracing::debug!(?opts, "Listing containers with options");
 
-    app.docker
+    docker
         .list_containers(Some(opts))
         .await
         .map(Json)
