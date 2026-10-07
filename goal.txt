@@ -1,0 +1,22 @@
+/goal Deliver a reliable Orqos MVP for Docker/Podman containers and Kubernetes pods, verified by meaningful regression tests, reproducible local smoke tests, and passing CI checks.
+
+Read AGENTS.md, README.md, ROADMAP.md, and docs/ASSESSMENT.md first. Keep the implementation small and focused on the roadmap's next milestone.
+
+Current evidence: Docker Desktop and a one-node kind cluster running Kubernetes 1.36.4 are available; kubectl is 1.36.5. Docker context is desktop-linux and Kubernetes context is docker-desktop. Live Kubernetes tests passed create/list/filter/delete, successful buffered exec, uploads with permissions/overwrite checks, and pod events. Both backends return five NUL bytes instead of 'audit' and reject WebSocket command queries. Kubernetes reports exit 7 as -1. The assessment predates these Kubernetes checks; update it with verified results.
+
+Work in this order:
+1. Fix file reads on both backends, including exact bytes, empty files, directory/symlink rejection, and existing path restrictions. Fix Docker upload destinations, overwrite checks, and propagation of chown/chmod failures.
+2. Make WebSocket exec accept a documented command encoding on both backends. Preserve stdout/stderr JSON frames and the final exit-code sentinel. Preserve real Kubernetes command exit codes and drain stdout/stderr concurrently without hanging on large stderr output.
+3. Make Docker socket selection and backend reachability explicit. Support Docker-only, Kubernetes-only, and combined startup, including one unavailable backend. Add /healthz with accurate backend availability and useful failure responses.
+4. Ensure Kubernetes pod deletion events are delivered and distinguishable, preserving the event source field. Define/document minimal Docker image-pull behavior and support optional container command overrides.
+5. Add regression tests and repeatable smoke checks; add PR/push CI checks while retaining release builds. Align OpenAPI, README.md, ROADMAP.md, and docs/ASSESSMENT.md with the resulting behavior.
+
+Completion criteria:
+- cargo build --locked, cargo fmt --check, cargo test --locked, and cargo clippy --locked --all-targets -- -D warnings pass. Tests exercise the confirmed defects and meaningful failure cases.
+- Both backends pass create/list/filter/exec/write/read/stop-or-delete checks. Verify exact file bytes, overwrite rules, permission failures, stdout/stderr, nonzero exit codes, WebSocket exec, and pod deletion events.
+- Startup/health checks correctly distinguish reachable and unavailable backends in all three modes. Document reproducible commands, results, and any remaining limitations.
+- All disposable test resources and daemon processes are cleaned up.
+
+Constraints: Preserve existing file-path safeguards and unrelated workspace changes. Use the existing local Docker/Kubernetes setup; pin both contexts explicitly. Modify only test resources created for this work. Keep API changes minimal and documented. Defer Kubernetes metrics, pod log streaming, and broad architecture/dependency upgrades.
+
+After each fix, run the relevant check and use its result to choose the next step. If blocked, complete independent work and report the blocker, evidence, and prerequisite needed to finish. Do not claim completion while required verification remains outstanding.

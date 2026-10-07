@@ -1,4 +1,4 @@
-use std::{io::Cursor, path::Path, sync::Arc};
+use std::sync::Arc;
 
 use axum::{
     extract::{Path as AxumPath, State},
@@ -7,17 +7,13 @@ use axum::{
 };
 use bollard::{body_full, query_parameters::UploadToContainerOptions, Docker};
 use serde::{Deserialize, Serialize};
-use tar::{Builder, Header};
 use utoipa::ToSchema;
 
-use crate::{
-    routes::exec::{exec_once_handler, ExecRequest},
-    state::AppState,
-};
+use crate::app_state::AppState;
+use crate::routes::docker::exec::{exec_once_handler, ExecRequest};
+use crate::routes::shared::files::{check_command, check_overwrite, write_archive};
 
-/// ─────────────────────────────────────────────────────────────
 /// Request/response DTOs
-/// ─────────────────────────────────────────────────────────────
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct WriteFileRequest {
     /// **Absolute** path inside the target container
@@ -39,9 +35,10 @@ pub struct WriteFileResponse {
 
 #[utoipa::path(
     post,
-    path = "/containers/{id}/write-file",
+    path = "/docker/containers/{id}/write-file",
     request_body = WriteFileRequest,
     responses(
+        (status = 503, description = "Enabled backend is unavailable", body = crate::routes::shared::health::BackendHealth),
         (status = 200, description = "File written successfully", body = WriteFileResponse),
         (status = 409, description = "File exists and overwrite is false"),
         (status = 400, description = "Invalid request"),
@@ -50,28 +47,14 @@ pub struct WriteFileResponse {
     params(
         ("id" = String, Path, description = "Container ID or name")
     ),
-    tag = "Containers"
+    tag = "Docker Containers"
 )]
 pub async fn write_file_handler(
     State(state): State<Arc<AppState>>,
     AxumPath(container_id): AxumPath<String>,
     Json(payload): Json<WriteFileRequest>,
 ) -> Result<Json<WriteFileResponse>, (StatusCode, String)> {
-    // 0) Validate the path we got.
-    if !payload.path.starts_with('/') {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "path must be absolute (begin with '/')".into(),
-        ));
-    }
-
-    // Validate against path traversal
-    if payload.path.contains("/../") || payload.path.contains("/./") {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "path contains invalid sequences".into(),
-        ));
-    }
+    let (parent_dir, tar_bytes) = write_archive(&payload.path, payload.content.as_bytes())?;
 
     if payload.overwrite == Some(false) {
         let exists_req = ExecRequest {
@@ -79,63 +62,16 @@ pub async fn write_file_handler(
             user: Some("root".into()),
         };
 
-        let exists_result = exec_once_handler(
+        let Json(exists_result) = exec_once_handler(
             axum::extract::State(state.clone()),
             axum::extract::Path(container_id.clone()),
             Json(exists_req),
         )
-        .await;
-
-        if exists_result.is_ok() {
-            return Err((
-                StatusCode::CONFLICT,
-                format!("Refusing to overwrite existing file at {}", payload.path),
-            ));
-        }
+        .await?;
+        check_overwrite(exists_result.exit_code, &exists_result.stderr)?;
     }
 
-    // 1) Build an in-memory tar that contains exactly one file.
-    let mut tar_bytes = Vec::<u8>::new();
-    {
-        let mut builder = Builder::new(&mut tar_bytes);
-
-        // Header describing the single file
-        let mut header = Header::new_gnu();
-        header.set_size(payload.content.len() as u64);
-        header.set_mode(0o644); // regular file 0644
-        header.set_cksum();
-
-        // • paths inside the tar **must NOT be absolute** – strip the leading `/`
-        let rel_path = &payload.path[1..];
-
-        builder
-            .append_data(
-                &mut header,
-                rel_path,
-                Cursor::new(payload.content.as_bytes()),
-            )
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("tar build error: {e}"),
-                )
-            })?;
-
-        builder.finish().map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("tar finish: {e}"),
-            )
-        })?;
-    }
-
-    // 2) Stream that tar straight into the container.
-    let parent_dir = Path::new(&payload.path)
-        .parent()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "/".to_owned());
-
-    let docker: &Docker = &state.docker;
+    let docker: &Docker = &state.docker.as_ref().unwrap().docker;
 
     docker
         .upload_to_container(
@@ -149,8 +85,7 @@ pub async fn write_file_handler(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("docker cp: {e}")))?;
 
-    // 3) Fix ownership and perms through the already-working exec_once_handler  ✅
-    //    (we wrap the extractors by hand so we can call it like a normal function)
+    // 3) Fix ownership and perms through exec_once_handler
     use axum::extract::{Path as AxPath, State as AxState};
 
     if let Some(owner) = &payload.owner {
@@ -159,13 +94,14 @@ pub async fn write_file_handler(
             user: Some("root".into()),
         };
 
-        let _ = exec_once_handler(
+        let Json(result) = exec_once_handler(
             AxState(state.clone()),
             AxPath(container_id.clone()),
             Json(exec_req),
         )
         .await
         .map_err(|(sc, msg)| (sc, format!("exec chown failed: {msg}")))?;
+        check_command("chown", result.exit_code, &result.stderr)?;
     }
 
     if let Some(mode) = &payload.mode {
@@ -174,13 +110,14 @@ pub async fn write_file_handler(
             user: Some("root".into()),
         };
 
-        let _ = exec_once_handler(
+        let Json(result) = exec_once_handler(
             AxState(state.clone()),
             AxPath(container_id.clone()),
             Json(exec_req),
         )
         .await
         .map_err(|(sc, msg)| (sc, format!("exec chmod failed: {msg}")))?;
+        check_command("chmod", result.exit_code, &result.stderr)?;
     }
 
     Ok(Json(WriteFileResponse { status: "ok" }))

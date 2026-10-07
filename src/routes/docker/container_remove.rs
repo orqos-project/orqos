@@ -8,7 +8,7 @@ use serde::Deserialize;
 use std::sync::Arc;
 use utoipa::ToSchema;
 
-use crate::state::AppState;
+use crate::app_state::AppState;
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct RemoveContainerRequest {
@@ -18,34 +18,36 @@ pub struct RemoveContainerRequest {
 
 #[utoipa::path(
     post,
-    path = "/containers/:id/remove",
+    path = "/docker/containers/{id}/remove",
     params(
         ("id" = String, Path, description = "Container ID or name")
     ),
     request_body(content = RemoveContainerRequest, description = "Options", content_type = "application/json"),
     responses(
+        (status = 503, description = "Enabled backend is unavailable", body = crate::routes::shared::health::BackendHealth),
         (status = 204, description = "Container removed successfully"),
         (status = 404, description = "Container not found"),
         (status = 500, description = "Internal server error")
     ),
-    tag = "Containers",
+    tag = "Docker Containers",
 )]
 pub async fn remove_container_handler(
     State(state): State<Arc<AppState>>,
     Path(container_id): Path<String>,
     maybe_json: Option<Json<RemoveContainerRequest>>,
 ) -> StatusCode {
+    let docker = &state.docker.as_ref().unwrap().docker;
     let (force, v) = maybe_json
         .map(|Json(req)| (req.force, req.v))
         .unwrap_or((None, None));
 
     tracing::debug!("Removing container {container_id} with force: {force:?}, v: {v:?}");
 
-    match remove_container(&state.docker, &container_id, force, v).await {
+    match remove_container(docker, &container_id, force, v).await {
         Ok(()) => StatusCode::NO_CONTENT,
-        Err(BollardError::DockerResponseServerError { status_code, .. }) if status_code == 404 => {
-            StatusCode::NOT_FOUND
-        }
+        Err(BollardError::DockerResponseServerError {
+            status_code: 404, ..
+        }) => StatusCode::NOT_FOUND,
         Err(e) => {
             tracing::error!("failed to remove container {container_id}: {e}");
             StatusCode::INTERNAL_SERVER_ERROR

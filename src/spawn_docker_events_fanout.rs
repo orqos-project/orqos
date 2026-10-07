@@ -40,8 +40,11 @@ pub(crate) fn spawn_event_fanout(docker: Docker, tx: broadcast::Sender<Value>) -
                     Ok(ev) => {
                         received_any = true;
                         if let Ok(js) = serde_json::to_value(&ev) {
-                            // If all receivers lag/dropped, `send` errs.
-                            if let Err(err) = tx.send(js) {
+                            let wrapped = serde_json::json!({
+                                "source": "docker",
+                                "event": js
+                            });
+                            if let Err(err) = tx.send(wrapped) {
                                 // If receiver count dropped to 0 mid‑flight, downgrade to debug.
                                 if tx.receiver_count() == 0 {
                                     tracing::debug!(?err, "all receivers gone; dropping events");

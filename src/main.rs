@@ -1,9 +1,13 @@
+pub mod app_state;
+pub mod backends;
+pub mod docker_state;
+pub mod kube_state;
 pub mod metric_poller;
 pub mod metric_registry;
 pub mod router;
 pub mod routes;
 pub mod spawn_docker_events_fanout;
-pub mod state;
+pub mod spawn_kube_events_fanout;
 pub mod stats;
 
 use std::collections::HashMap;
@@ -12,8 +16,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use bollard::Docker;
-use bollard::API_DEFAULT_VERSION;
 use tokio::net::TcpListener;
 use tokio::signal;
 use tokio::sync::broadcast;
@@ -21,45 +23,110 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use crate::metric_poller::poll_metrics_into_registry;
+use crate::app_state::AppState;
+use crate::backends::{connect_docker, connect_kube, probe_docker, probe_kube, BackendSelection};
+use crate::docker_state::{CpuSnapshot, DockerState};
+use crate::kube_state::KubeState;
+use crate::metric_poller::poll_docker_metrics;
 use crate::metric_registry::MetricRegistry;
 use crate::router::build_router;
 use crate::spawn_docker_events_fanout::spawn_event_fanout;
-use crate::state::AppState;
-use crate::state::CpuSnapshot;
+use crate::spawn_kube_events_fanout::spawn_kube_event_fanout;
 use crate::stats::push_stats_to_ws_clients;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    let docker = match Docker::connect_with_local_defaults() {
-        Ok(d) => d,
-        Err(_) => {
-            // Fall back to Desktop socket if DEFAULT_SOCKET or DOCKER_HOST unset
-            let sock = format!("{}/.docker/desktop/docker.sock", std::env::var("HOME")?);
-            Docker::connect_with_unix(&sock, 120, API_DEFAULT_VERSION)?
-        }
+    let backends =
+        BackendSelection::parse(&env::var("ORQOS_BACKENDS").unwrap_or_else(|_| "both".into()))
+            .map_err(anyhow::Error::msg)?;
+    let docker_result = if backends.docker {
+        connect_docker()
+    } else {
+        Err("disabled".into())
     };
-    tracing::info!("Connected to Docker {:?}", docker.version().await?.version);
+    let kube_result = if backends.kube {
+        connect_kube().await
+    } else {
+        Err("disabled".into())
+    };
+    let docker_error = docker_result.as_ref().err().cloned();
+    let kube_error = kube_result.as_ref().err().cloned();
+    let maybe_docker = docker_result.ok();
+    let maybe_kube_client = kube_result.ok();
+    let (docker_probe, kube_probe) = tokio::join!(
+        async {
+            if let Some(docker) = &maybe_docker {
+                probe_docker(docker).await
+            } else {
+                Err(docker_error.clone().unwrap_or_default())
+            }
+        },
+        async {
+            if let Some(client) = &maybe_kube_client {
+                probe_kube(client).await
+            } else {
+                Err(kube_error.clone().unwrap_or_default())
+            }
+        }
+    );
+    for (name, enabled, result) in [
+        ("Docker", backends.docker, &docker_probe),
+        ("Kubernetes", backends.kube, &kube_probe),
+    ] {
+        if enabled {
+            match result {
+                Ok(()) => info!(backend = name, "Backend is reachable"),
+                Err(error) => warn!(backend = name, %error, "Backend is unavailable"),
+            }
+        }
+    }
+    if let (Err(docker_error), Err(kube_error)) = (docker_probe, kube_probe) {
+        anyhow::bail!(
+            "No enabled backend is reachable: Docker: {}; Kubernetes: {}",
+            docker_error,
+            kube_error
+        );
+    }
 
-    // Events broadcast channel (100-message ring buffer)
+    // Shared broadcast channels
     let (events_tx, _) = broadcast::channel(100);
-
-    // Stats broadcast channel (100-message ring buffer)
     let (stats_tx, _) = broadcast::channel(100);
 
-    // Spawn fan-out
-    let event_handle: JoinHandle<()> = spawn_event_fanout(docker.clone(), events_tx.clone());
+    // Build optional backend states
+    let docker_state = maybe_docker.map(|docker| {
+        Arc::new(DockerState {
+            docker,
+            cpu_snapshots: RwLock::<HashMap<String, CpuSnapshot>>::default(),
+        })
+    });
+
+    let kube_state = maybe_kube_client.map(|client| {
+        let namespace = env::var("KUBE_NAMESPACE").unwrap_or_else(|_| "default".into());
+        Arc::new(KubeState { client, namespace })
+    });
+
+    // Conditionally spawn event fan-outs
+    let maybe_docker_event_handle: Option<JoinHandle<()>> = docker_state
+        .as_ref()
+        .map(|ds| spawn_event_fanout(ds.docker.clone(), events_tx.clone()));
+
+    let maybe_kube_event_handle: Option<JoinHandle<()>> = kube_state
+        .as_ref()
+        .map(|ks| spawn_kube_event_fanout(ks.client.clone(), events_tx.clone()));
 
     let metric_registry = MetricRegistry::default();
 
     let app_state = Arc::new(AppState {
-        docker,
+        backends,
+        docker_error,
+        kube_error,
+        docker: docker_state,
+        kube: kube_state,
         events_tx,
         stats_tx,
         metric_registry,
-        cpu_snapshots: RwLock::<HashMap<String, CpuSnapshot>>::default(),
     });
 
     let router = build_router(app_state.clone());
@@ -82,16 +149,18 @@ async fn main() -> Result<()> {
     let metric_handle: JoinHandle<()> = tokio::spawn(async move {
         let interval = Duration::from_secs(5);
         loop {
-            if let Err(e) = tokio::time::timeout(
-                Duration::from_secs(30),
-                poll_metrics_into_registry(state_clone.clone()),
-            )
-            .await
-            {
-                warn!(?e, "Metric polling timed out or failed");
+            if let Some(ref docker) = state_clone.docker {
+                if let Err(e) = tokio::time::timeout(
+                    Duration::from_secs(30),
+                    poll_docker_metrics(docker, &state_clone.metric_registry),
+                )
+                .await
+                {
+                    warn!(?e, "Docker metric polling timed out or failed");
+                }
             }
 
-            push_stats_to_ws_clients(state_clone.clone());
+            push_stats_to_ws_clients(&state_clone);
 
             tokio::time::sleep(interval).await;
         }
@@ -101,13 +170,21 @@ async fn main() -> Result<()> {
         .with_graceful_shutdown(shutdown_signal)
         .await?;
 
-    // Clean shutdown: stop event stream task
-    event_handle.abort();
-    if let Err(e) = event_handle.await {
-        warn!(?e, "event fan-out task aborted while shutting down");
+    // Clean shutdown
+    if let Some(handle) = maybe_docker_event_handle {
+        handle.abort();
+        if let Err(e) = handle.await {
+            warn!(?e, "Docker event fan-out task aborted while shutting down");
+        }
     }
 
-    // Stop metric polling task
+    if let Some(handle) = maybe_kube_event_handle {
+        handle.abort();
+        if let Err(e) = handle.await {
+            warn!(?e, "Kube event fan-out task aborted while shutting down");
+        }
+    }
+
     metric_handle.abort();
     if let Err(e) = metric_handle.await {
         warn!(?e, "metric polling task aborted while shutting down");

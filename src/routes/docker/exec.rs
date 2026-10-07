@@ -1,7 +1,7 @@
 //! Exec support for Orqos
 //! -----------------------------------------------------------
-//! * REST   POST /containers/:id/exec        → buffered stdout/stderr + exit‑code (JSON)
-//! * WS     GET  /containers/:id/exec/ws     → live stream of stdout/stderr frames
+//! * REST   POST /docker/containers/:id/exec        → buffered stdout/stderr + exit‑code (JSON)
+//! * WS     GET  /docker/containers/:id/exec/ws     → live stream of stdout/stderr frames
 //!
 //! All functions are async + Tokio‑friendly.  No Arc<Docker> is needed –
 //! `bollard::Docker` is internally Arc‑backed and `Clone`.
@@ -29,9 +29,10 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::error;
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 
-use crate::state::AppState;
+use crate::app_state::AppState;
+use crate::routes::shared::exec::decode_command;
 
 // ---------------------------------------------------------------------------
 // JSON payloads
@@ -53,6 +54,14 @@ pub struct ExecResponse {
     pub exit_code: i64,
 }
 
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct ExecWsQuery {
+    /// URL-encoded JSON array of command arguments, e.g. ["echo","hello"].
+    pub cmd: String,
+    pub user: Option<String>,
+}
+
 lazy_static! {
     static ref CONTAINER_ID_RE: Regex = Regex::new(r"^[a-zA-Z0-9_.-]{1,64}$").unwrap();
 }
@@ -66,7 +75,7 @@ fn validate_container_id(id: &str) -> Result<(), &'static str> {
 }
 
 fn validate_command(cmd: &[String]) -> Result<(), &'static str> {
-    if cmd.is_empty() {
+    if cmd.is_empty() || cmd[0].is_empty() {
         return Err("Command cannot be empty");
     }
     // Add any other policy checks you need (black‑list, length, etc.)
@@ -75,16 +84,18 @@ fn validate_command(cmd: &[String]) -> Result<(), &'static str> {
 
 #[utoipa::path(
     post,
-    path = "/containers/{id}/exec",
+    path = "/docker/containers/{id}/exec",
     request_body = ExecRequest,
     responses(
+        (status = 503, description = "Enabled backend is unavailable", body = crate::routes::shared::health::BackendHealth),
         (status = 200, description = "Command executed successfully", body = ExecResponse),
+        (status = 400, description = "Invalid container ID or empty command"),
         (status = 500, description = "Internal server error"),
     ),
     params(
         ("id" = String, Path, description = "ID or name of the container"),
     ),
-    tag = "Containers",
+    tag = "Docker Containers",
     operation_id = "exec_in_container",
     summary = "Execute a command in a running container",
     description = "Creates a one-time `docker exec` session inside the specified container and returns the captured stdout/stderr output and exit code."
@@ -94,12 +105,12 @@ pub async fn exec_once_handler(
     Path(container): Path<String>,
     Json(req): Json<ExecRequest>,
 ) -> Result<Json<ExecResponse>, (StatusCode, String)> {
+    let docker = &state.docker.as_ref().unwrap().docker;
     validate_container_id(&container).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     validate_command(&req.cmd).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
     // 1. Create the exec instance
-    let exec = state
-        .docker
+    let exec = docker
         .create_exec(
             &container,
             CreateExecOptions {
@@ -114,8 +125,7 @@ pub async fn exec_once_handler(
         .map_err(err_500)?;
 
     // 2. Start & attach
-    let mut output = match state
-        .docker
+    let mut output = match docker
         .start_exec(&exec.id, Option::<StartExecOptions>::None)
         .await
         .map_err(err_500)?
@@ -142,7 +152,7 @@ pub async fn exec_once_handler(
     }
 
     // 4. Inspect for exit code
-    let inspect = state.docker.inspect_exec(&exec.id).await.map_err(err_500)?;
+    let inspect = docker.inspect_exec(&exec.id).await.map_err(err_500)?;
 
     Ok(Json(ExecResponse {
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
@@ -153,7 +163,7 @@ pub async fn exec_once_handler(
 
 /// WebSocket Exec Protocol:
 /// ------------------------
-/// When a client connects to `/containers/:id/exec/ws`, the server streams
+/// When a client connects to `/docker/containers/:id/exec/ws`, the server streams
 /// stdout and stderr output from the attached `docker exec` session as
 /// structured JSON text messages in the format:
 /// `{"stream": "stdout|stderr", "data": "<output>"}`
@@ -172,23 +182,36 @@ pub async fn exec_once_handler(
 ///     Text frame: "__exit_code:0"
 ///
 /// Note: The default exit code fallback is `-1` if Docker provides no value.
+#[utoipa::path(
+    get, path = "/docker/containers/{id}/exec/ws",
+    params(("id" = String, Path, description = "Container ID or name"), ExecWsQuery),
+    responses(
+        (status = 503, description = "Enabled backend is unavailable", body = crate::routes::shared::health::BackendHealth),(status = 101, description = "JSON stdout/stderr frames, then __exit_code:N"),
+        (status = 400, description = "Invalid ID or command encoding")),
+    tag = "Docker Containers"
+)]
 pub async fn exec_ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
     Path(container): Path<String>,
-    Query(req): Query<ExecRequest>,
+    Query(query): Query<ExecWsQuery>,
 ) -> impl IntoResponse {
     // Validate container ID
     if let Err(e) = validate_container_id(&container) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
 
-    // Validate command vector
-    if let Err(e) = validate_command(&req.cmd) {
-        return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
-    }
+    let cmd = match decode_command(&query.cmd) {
+        Ok(cmd) => cmd,
+        Err(error) => return error.into_response(),
+    };
+    let req = ExecRequest {
+        cmd,
+        user: query.user,
+    };
 
-    ws.on_upgrade(move |socket| stream_exec_over_ws(socket, state.docker.clone(), container, req))
+    let docker = state.docker.as_ref().unwrap().docker.clone();
+    ws.on_upgrade(move |socket| stream_exec_over_ws(socket, docker, container, req))
 }
 
 async fn stream_exec_over_ws(
@@ -277,7 +300,7 @@ async fn stream_exec_over_ws(
 // ---------------------------------------------------------------------------
 // Helper – convert any error into a 500 tuple and log it
 // ---------------------------------------------------------------------------
-fn err_500<E: std::fmt::Display>(err: E) -> (StatusCode, String) {
+pub(crate) fn err_500<E: std::fmt::Display>(err: E) -> (StatusCode, String) {
     error!("{err}");
     (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
 }
