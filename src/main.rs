@@ -82,11 +82,11 @@ async fn main() -> Result<()> {
             }
         }
     }
-    if docker_probe.is_err() && kube_probe.is_err() {
+    if let (Err(docker_error), Err(kube_error)) = (docker_probe, kube_probe) {
         anyhow::bail!(
             "No enabled backend is reachable: Docker: {}; Kubernetes: {}",
-            docker_probe.unwrap_err(),
-            kube_probe.unwrap_err()
+            docker_error,
+            kube_error
         );
     }
 

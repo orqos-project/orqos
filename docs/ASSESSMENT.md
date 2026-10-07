@@ -21,7 +21,7 @@ The [smoke script](SMOKE.md) used `desktop-linux` and `docker-desktop`, a unique
 
 ## CI and Remaining Limits
 
-Push/PR checks now build, format, test, lint with warnings denied, and run Docker smoke checks. Release artifacts remain configured. Hosted CI has not run for these uncommitted changes; local equivalents passed.
+Push/PR checks build, format, test, lint with warnings denied, and run Docker smoke checks. Release artifacts remain configured. Rust 1.99.0 is pinned for reproducibility; startup error matching replaces the checked unwraps rejected by the original push runner.
 
 Podman has not been tested live. Kubernetes metrics and pod logs remain deferred. File transfer buffers data in memory; writes and metadata changes are separate steps, and overwrite checks are not atomic. Kubernetes targets require standard file utilities. Event delivery is best effort across disconnects. Configuration/client-construction failures require restart; live clients are rechecked.
 

@@ -46,7 +46,7 @@ File writes accept UTF-8 `content`; reads return raw bytes under `ORQOS_READ_BAS
 
 ## Validation
 
-Run `cargo fmt --check`, `cargo test --locked`, and `cargo clippy --locked --all-targets -- -D warnings`. [Smoke checks](docs/SMOKE.md) verify real backends and clean up their fixtures. Push/PR CI runs these Rust checks, a build, and Docker smoke checks; published releases retain artifact builds.
+Run `cargo fmt --check`, `cargo test --locked`, and `cargo clippy --locked --all-targets -- -D warnings`. [Smoke checks](docs/SMOKE.md) verify real backends and clean up their fixtures. CI uses Rust 1.99.0 for checks and release builds. Push/PR CI runs these Rust checks, a build, and Docker smoke checks; published releases retain artifact builds.
 
 ## Use Cases
 
