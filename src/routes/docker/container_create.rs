@@ -19,6 +19,8 @@ use crate::app_state::AppState;
 pub struct ContainerCreate {
     pub name: String,
     pub image: String,
+    /// Optional command override; omit to use the image default. Images must already be pulled.
+    pub cmd: Option<Vec<String>>,
     pub cpu: Option<String>,    // "2", "1.5"
     pub memory: Option<String>, // "1g"
     pub swap: Option<String>,   // "2g"
@@ -109,7 +111,11 @@ fn parse_bytes(s: &str) -> u64 {
         })
     ),
     responses(
+        (status = 503, description = "Enabled backend is unavailable", body = crate::routes::shared::health::BackendHealth),
         (status = 200, description = "Container created", body = ContainerInfo),
+        (status = 400, description = "Empty command override"),
+        (status = 404, description = "Image or configured resource missing; pull images before creation"),
+        (status = 409, description = "Container name already exists"),
         (status = 500, description = "Internal server error"),
     ),
     tag = "Docker Containers",
@@ -122,6 +128,14 @@ pub(crate) async fn create_container_handler(
 ) -> Result<Json<ContainerInfo>, (StatusCode, String)> {
     let docker: &Docker = &app.docker.as_ref().unwrap().docker;
     let cname = req.name.clone();
+    if let Some(command) = &req.cmd {
+        if command.is_empty() || command[0].is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Command override cannot be empty".into(),
+            ));
+        }
+    }
 
     // Ports
     let mut exposed: HashMap<String, HashMap<(), ()>> = HashMap::new();
@@ -175,6 +189,7 @@ pub(crate) async fn create_container_handler(
     // Container config
     let cfg = ContainerCreateBody {
         image: Some(req.image),
+        cmd: req.cmd,
         env: req.env,
         labels: req.labels.clone(),
         exposed_ports: if exposed.is_empty() {
@@ -194,7 +209,7 @@ pub(crate) async fn create_container_handler(
     let resp = docker
         .create_container(Some(opts), cfg)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(create_error)?;
 
     docker
         .start_container(
@@ -209,4 +224,43 @@ pub(crate) async fn create_container_handler(
         id: resp.id,
         ports: port_report,
     }))
+}
+
+fn create_error(error: bollard::errors::Error) -> (StatusCode, String) {
+    match error {
+        bollard::errors::Error::DockerResponseServerError {
+            status_code: 404,
+            message,
+        } => (
+            StatusCode::NOT_FOUND,
+            format!(
+                "{message}. Images must be pulled into the selected Docker engine before creation."
+            ),
+        ),
+        bollard::errors::Error::DockerResponseServerError {
+            status_code: 409,
+            message,
+        } => (StatusCode::CONFLICT, message),
+        error => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_images_and_name_conflicts_have_useful_statuses() {
+        let missing = create_error(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404,
+            message: "No such image".into(),
+        });
+        assert_eq!(missing.0, StatusCode::NOT_FOUND);
+        assert!(missing.1.contains("pulled"));
+        let conflict = create_error(bollard::errors::Error::DockerResponseServerError {
+            status_code: 409,
+            message: "Name already exists".into(),
+        });
+        assert_eq!(conflict.0, StatusCode::CONFLICT);
+    }
 }

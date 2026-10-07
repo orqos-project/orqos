@@ -25,6 +25,7 @@ pub struct StopContainerRequest {
     ),
     request_body(content = StopContainerRequest, description = "Stop options", content_type = "application/json"),
     responses(
+        (status = 503, description = "Enabled backend is unavailable", body = crate::routes::shared::health::BackendHealth),
         (status = 204, description = "Container stopped successfully"),
         (status = 404, description = "Container not found"),
         (status = 500, description = "Internal server error")
@@ -45,9 +46,9 @@ pub async fn stop_container_handler(
 
     match stop_container(docker, &container_id, capped_t, signal).await {
         Ok(()) => StatusCode::NO_CONTENT,
-        Err(BollardError::DockerResponseServerError { status_code, .. }) if status_code == 404 => {
-            StatusCode::NOT_FOUND
-        }
+        Err(BollardError::DockerResponseServerError {
+            status_code: 404, ..
+        }) => StatusCode::NOT_FOUND,
         Err(e) => {
             tracing::error!("failed to stop container {container_id}: {e}");
             StatusCode::INTERNAL_SERVER_ERROR

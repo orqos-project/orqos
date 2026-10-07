@@ -1,6 +1,6 @@
 use futures_util::StreamExt;
 use k8s_openapi::api::core::v1::Pod;
-use kube::{runtime::watcher, runtime::WatchStreamExt, Api, Client as KubeClient};
+use kube::{runtime::watcher, Api, Client as KubeClient};
 use serde_json::Value;
 use std::time::Duration;
 use tokio::{spawn, sync::broadcast, task::JoinHandle, time::sleep};
@@ -27,7 +27,7 @@ pub(crate) fn spawn_kube_event_fanout(
 
             let pods: Api<Pod> = Api::all(client.clone());
             let wc = watcher::Config::default();
-            let mut stream = watcher(pods, wc).applied_objects().boxed();
+            let mut stream = watcher(pods, wc).boxed();
             attempt += 1;
             tracing::debug!(target: "kube-event-fanout", attempt, "subscribing to Kube pod events");
 
@@ -35,16 +35,15 @@ pub(crate) fn spawn_kube_event_fanout(
 
             while let Some(event) = stream.next().await {
                 match event {
-                    Ok(pod) => {
+                    Ok(event) => {
                         received_any = true;
-                        if let Ok(js) = serde_json::to_value(&pod) {
-                            let wrapped = serde_json::json!({
-                                "source": "kube",
-                                "event": js
-                            });
+                        if let Some(wrapped) = event_message(event) {
                             if let Err(err) = tx.send(wrapped) {
                                 if tx.receiver_count() == 0 {
-                                    tracing::debug!(?err, "all receivers gone; dropping kube events");
+                                    tracing::debug!(
+                                        ?err,
+                                        "all receivers gone; dropping kube events"
+                                    );
                                     break;
                                 } else {
                                     tracing::warn!(
@@ -71,4 +70,40 @@ pub(crate) fn spawn_kube_event_fanout(
             sleep(backoff).await;
         }
     })
+}
+
+fn event_message(event: watcher::Event<Pod>) -> Option<Value> {
+    let (kind, pod) = match event {
+        watcher::Event::Apply(pod) | watcher::Event::InitApply(pod) => ("APPLIED", pod),
+        watcher::Event::Delete(pod) => ("DELETED", pod),
+        watcher::Event::Init | watcher::Event::InitDone => return None,
+    };
+    Some(serde_json::json!({ "source": "kube", "type": kind, "event": pod }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deletion_events_preserve_source_and_pod_identity() {
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "smoke", "namespace": "test"}
+        }))
+        .unwrap();
+        let deleted = event_message(watcher::Event::Delete(pod.clone())).unwrap();
+        assert_eq!(deleted["source"], "kube");
+        assert_eq!(deleted["type"], "DELETED");
+        assert_eq!(deleted["event"]["metadata"]["name"], "smoke");
+        assert_eq!(
+            event_message(watcher::Event::Apply(pod.clone())).unwrap()["type"],
+            "APPLIED"
+        );
+        assert_eq!(
+            event_message(watcher::Event::InitApply(pod)).unwrap()["type"],
+            "APPLIED"
+        );
+        assert!(event_message(watcher::Event::Init).is_none());
+        assert!(event_message(watcher::Event::InitDone).is_none());
+    }
 }

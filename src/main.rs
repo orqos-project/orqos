@@ -1,4 +1,5 @@
 pub mod app_state;
+pub mod backends;
 pub mod docker_state;
 pub mod kube_state;
 pub mod metric_poller;
@@ -15,9 +16,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use bollard::Docker;
-use bollard::API_DEFAULT_VERSION;
-use kube::{Client as KubeClient, Config as KubeConfig};
 use tokio::net::TcpListener;
 use tokio::signal;
 use tokio::sync::broadcast;
@@ -26,6 +24,7 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::app_state::AppState;
+use crate::backends::{connect_docker, connect_kube, probe_docker, probe_kube, BackendSelection};
 use crate::docker_state::{CpuSnapshot, DockerState};
 use crate::kube_state::KubeState;
 use crate::metric_poller::poll_docker_metrics;
@@ -35,44 +34,60 @@ use crate::spawn_docker_events_fanout::spawn_event_fanout;
 use crate::spawn_kube_events_fanout::spawn_kube_event_fanout;
 use crate::stats::push_stats_to_ws_clients;
 
-async fn try_docker() -> Option<Docker> {
-    let docker = Docker::connect_with_local_defaults()
-        .or_else(|_| {
-            let sock = env::var("DOCKER_SOCKET")
-                .unwrap_or_else(|_| "/var/run/docker.sock".to_string());
-            Docker::connect_with_unix(&sock, 30, API_DEFAULT_VERSION)
-        })
-        .ok()?;
-
-    Some(docker)
-}
-
-async fn try_kube() -> Option<KubeClient> {
-    let config = KubeConfig::infer().await.ok()?;
-    let client = KubeClient::try_from(config).ok()?;
-    Some(client)
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    let maybe_docker = try_docker().await;
-    let maybe_kube_client = try_kube().await;
-
-    if maybe_docker.is_none() && maybe_kube_client.is_none() {
-        anyhow::bail!("Neither Docker nor Kubernetes is available");
+    let backends =
+        BackendSelection::parse(&env::var("ORQOS_BACKENDS").unwrap_or_else(|_| "both".into()))
+            .map_err(anyhow::Error::msg)?;
+    let docker_result = if backends.docker {
+        connect_docker()
+    } else {
+        Err("disabled".into())
+    };
+    let kube_result = if backends.kube {
+        connect_kube().await
+    } else {
+        Err("disabled".into())
+    };
+    let docker_error = docker_result.as_ref().err().cloned();
+    let kube_error = kube_result.as_ref().err().cloned();
+    let maybe_docker = docker_result.ok();
+    let maybe_kube_client = kube_result.ok();
+    let (docker_probe, kube_probe) = tokio::join!(
+        async {
+            if let Some(docker) = &maybe_docker {
+                probe_docker(docker).await
+            } else {
+                Err(docker_error.clone().unwrap_or_default())
+            }
+        },
+        async {
+            if let Some(client) = &maybe_kube_client {
+                probe_kube(client).await
+            } else {
+                Err(kube_error.clone().unwrap_or_default())
+            }
+        }
+    );
+    for (name, enabled, result) in [
+        ("Docker", backends.docker, &docker_probe),
+        ("Kubernetes", backends.kube, &kube_probe),
+    ] {
+        if enabled {
+            match result {
+                Ok(()) => info!(backend = name, "Backend is reachable"),
+                Err(error) => warn!(backend = name, %error, "Backend is unavailable"),
+            }
+        }
     }
-
-    if let Some(docker) = &maybe_docker {
-        tracing::info!(
-            "Connected to Docker {:?}",
-            docker.version().await?.version
+    if docker_probe.is_err() && kube_probe.is_err() {
+        anyhow::bail!(
+            "No enabled backend is reachable: Docker: {}; Kubernetes: {}",
+            docker_probe.unwrap_err(),
+            kube_probe.unwrap_err()
         );
-    }
-
-    if maybe_kube_client.is_some() {
-        tracing::info!("Connected to Kubernetes");
     }
 
     // Shared broadcast channels
@@ -104,6 +119,9 @@ async fn main() -> Result<()> {
     let metric_registry = MetricRegistry::default();
 
     let app_state = Arc::new(AppState {
+        backends,
+        docker_error,
+        kube_error,
         docker: docker_state,
         kube: kube_state,
         events_tx,

@@ -3,42 +3,18 @@ use axum::{
     http::{self, HeaderMap, HeaderValue, StatusCode},
     response::IntoResponse,
 };
-use flate2::read::GzDecoder;
 use serde::Deserialize;
-use std::{
-    env,
-    io::{Cursor, Read},
-    path::{Component, Path as StdPath, PathBuf},
-    sync::Arc,
-};
-use tar::{Archive, EntryType};
+use std::{env, path::PathBuf, sync::Arc};
 use utoipa::ToSchema;
 
 use crate::app_state::AppState;
 use crate::routes::kube::exec::kube_exec_capture;
+use crate::routes::shared::files::{read_archive, read_path};
 
 fn allowed_base() -> PathBuf {
     env::var_os("ORQOS_READ_BASE")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/home"))
-}
-
-fn clean_path(raw: &str) -> Result<PathBuf, &'static str> {
-    let p = StdPath::new(raw);
-    if !p.is_absolute() {
-        return Err("path must be absolute");
-    }
-    let mut out = PathBuf::new();
-    for comp in p.components() {
-        match comp {
-            Component::RootDir => out.push("/"),
-            Component::Normal(c) => out.push(c),
-            Component::CurDir => {}
-            Component::ParentDir => return Err("path traversal not allowed"),
-            _ => return Err("weird path component"),
-        }
-    }
-    Ok(out)
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -64,7 +40,9 @@ pub struct KubeReadFileRequest {
         ("name" = String, Path, description = "Pod name")
     ),
     responses(
+        (status = 503, description = "Enabled backend is unavailable", body = crate::routes::shared::health::BackendHealth),
         (status = 200, description = "Raw file bytes", content_type = "application/octet-stream"),
+        (status = 400, description = "Path must name one regular file"),
         (status = 404, description = "File not found"),
         (status = 403, description = "Forbidden path"),
         (status = 500, description = "Server error", body = String)
@@ -79,29 +57,11 @@ pub async fn kube_read_file_handler(
     let ks = state.kube.as_ref().unwrap();
     let ns = req.namespace.as_deref().unwrap_or(&ks.namespace);
 
-    let base = allowed_base();
-    let target =
-        clean_path(&req.path).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-
-    if !target.starts_with(&base) {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "path outside allowed base directory".into(),
-        ));
-    }
-
-    let ban = ["/etc", "/proc", "/sys", "/dev", "/var/run"];
-    for bad in ban {
-        if target.starts_with(bad) {
-            return Err((
-                StatusCode::FORBIDDEN,
-                "access to system dirs forbidden".into(),
-            ));
-        }
-    }
+    let target = read_path(&req.path, &allowed_base())?;
 
     // Strip leading / to get relative path for tar
-    let rel_path = &req.path[1..];
+    let target_string = target.to_string_lossy();
+    let rel_path = &target_string[1..];
 
     let (tar_bytes, stderr, exit_code) = kube_exec_capture(
         &ks.client,
@@ -127,39 +87,7 @@ pub async fn kube_read_file_handler(
         ));
     }
 
-    // Decode tar archive
-    let is_gz = tar_bytes.starts_with(&[0x1F, 0x8B]);
-    let cursor = Cursor::new(tar_bytes);
-    let reader: Box<dyn Read> = if is_gz {
-        Box::new(GzDecoder::new(cursor))
-    } else {
-        Box::new(cursor)
-    };
-    let mut archive = Archive::new(reader);
-
-    let mut entries = archive
-        .entries()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let mut file = entries
-        .next()
-        .ok_or((StatusCode::NOT_FOUND, "File not found".into()))?
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    if file.header().entry_type() == EntryType::Symlink {
-        return Err((StatusCode::FORBIDDEN, "symlinks not allowed".into()));
-    }
-
-    if entries.next().is_some() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "path appears to be a directory".into(),
-        ));
-    }
-
-    let mut content = Vec::new();
-    file.read_to_end(&mut content)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let content = read_archive(tar_bytes)?;
 
     let mime = infer::get(&content)
         .map(|t| t.mime_type())

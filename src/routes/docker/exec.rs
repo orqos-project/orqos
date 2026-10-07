@@ -29,9 +29,10 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::error;
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 
 use crate::app_state::AppState;
+use crate::routes::shared::exec::decode_command;
 
 // ---------------------------------------------------------------------------
 // JSON payloads
@@ -53,6 +54,14 @@ pub struct ExecResponse {
     pub exit_code: i64,
 }
 
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct ExecWsQuery {
+    /// URL-encoded JSON array of command arguments, e.g. ["echo","hello"].
+    pub cmd: String,
+    pub user: Option<String>,
+}
+
 lazy_static! {
     static ref CONTAINER_ID_RE: Regex = Regex::new(r"^[a-zA-Z0-9_.-]{1,64}$").unwrap();
 }
@@ -66,7 +75,7 @@ fn validate_container_id(id: &str) -> Result<(), &'static str> {
 }
 
 fn validate_command(cmd: &[String]) -> Result<(), &'static str> {
-    if cmd.is_empty() {
+    if cmd.is_empty() || cmd[0].is_empty() {
         return Err("Command cannot be empty");
     }
     // Add any other policy checks you need (black‑list, length, etc.)
@@ -78,7 +87,9 @@ fn validate_command(cmd: &[String]) -> Result<(), &'static str> {
     path = "/docker/containers/{id}/exec",
     request_body = ExecRequest,
     responses(
+        (status = 503, description = "Enabled backend is unavailable", body = crate::routes::shared::health::BackendHealth),
         (status = 200, description = "Command executed successfully", body = ExecResponse),
+        (status = 400, description = "Invalid container ID or empty command"),
         (status = 500, description = "Internal server error"),
     ),
     params(
@@ -171,21 +182,33 @@ pub async fn exec_once_handler(
 ///     Text frame: "__exit_code:0"
 ///
 /// Note: The default exit code fallback is `-1` if Docker provides no value.
+#[utoipa::path(
+    get, path = "/docker/containers/{id}/exec/ws",
+    params(("id" = String, Path, description = "Container ID or name"), ExecWsQuery),
+    responses(
+        (status = 503, description = "Enabled backend is unavailable", body = crate::routes::shared::health::BackendHealth),(status = 101, description = "JSON stdout/stderr frames, then __exit_code:N"),
+        (status = 400, description = "Invalid ID or command encoding")),
+    tag = "Docker Containers"
+)]
 pub async fn exec_ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
     Path(container): Path<String>,
-    Query(req): Query<ExecRequest>,
+    Query(query): Query<ExecWsQuery>,
 ) -> impl IntoResponse {
     // Validate container ID
     if let Err(e) = validate_container_id(&container) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
 
-    // Validate command vector
-    if let Err(e) = validate_command(&req.cmd) {
-        return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
-    }
+    let cmd = match decode_command(&query.cmd) {
+        Ok(cmd) => cmd,
+        Err(error) => return error.into_response(),
+    };
+    let req = ExecRequest {
+        cmd,
+        user: query.user,
+    };
 
     let docker = state.docker.as_ref().unwrap().docker.clone();
     ws.on_upgrade(move |socket| stream_exec_over_ws(socket, docker, container, req))

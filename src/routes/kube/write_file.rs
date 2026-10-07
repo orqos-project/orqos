@@ -1,4 +1,4 @@
-use std::{io::Cursor, path::Path as StdPath, sync::Arc};
+use std::sync::Arc;
 
 use axum::{
     extract::{Path, State},
@@ -9,13 +9,13 @@ use k8s_openapi::api::core::v1::Pod;
 use kube::api::AttachParams;
 use kube::Api;
 use serde::Deserialize;
-use tar::{Builder, Header};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use utoipa::ToSchema;
 
 use crate::app_state::AppState;
 use crate::routes::docker::write_file::WriteFileResponse;
-use crate::routes::kube::exec::kube_exec_capture;
+use crate::routes::kube::exec::{command_exit_code, kube_exec_capture};
+use crate::routes::shared::files::{check_overwrite, write_archive};
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct KubeWriteFileRequest {
@@ -48,6 +48,7 @@ pub struct KubeWriteFileRequest {
         ("name" = String, Path, description = "Pod name")
     ),
     responses(
+        (status = 503, description = "Enabled backend is unavailable", body = crate::routes::shared::health::BackendHealth),
         (status = 200, description = "File written successfully", body = WriteFileResponse),
         (status = 409, description = "File exists and overwrite is false"),
         (status = 400, description = "Invalid request"),
@@ -60,26 +61,14 @@ pub async fn kube_write_file_handler(
     Path(name): Path<String>,
     Json(payload): Json<KubeWriteFileRequest>,
 ) -> Result<Json<WriteFileResponse>, (StatusCode, String)> {
-    if !payload.path.starts_with('/') {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "path must be absolute (begin with '/')".into(),
-        ));
-    }
-
-    if payload.path.contains("/../") || payload.path.contains("/./") {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "path contains invalid sequences".into(),
-        ));
-    }
+    let (parent_dir, tar_bytes) = write_archive(&payload.path, payload.content.as_bytes())?;
 
     let ks = state.kube.as_ref().unwrap();
     let ns = payload.namespace.as_deref().unwrap_or(&ks.namespace);
 
     // Overwrite check
     if payload.overwrite == Some(false) {
-        let (_stdout, _stderr, exit_code) = kube_exec_capture(
+        let (_stdout, stderr, exit_code) = kube_exec_capture(
             &ks.client,
             ns,
             &name,
@@ -89,55 +78,8 @@ pub async fn kube_write_file_handler(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-        if exit_code == 0 {
-            return Err((
-                StatusCode::CONFLICT,
-                format!("Refusing to overwrite existing file at {}", payload.path),
-            ));
-        }
+        check_overwrite(exit_code, &stderr)?;
     }
-
-    // Build in-memory tar with just the filename as entry
-    let filename = StdPath::new(&payload.path)
-        .file_name()
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid path".into()))?
-        .to_str()
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "non-UTF-8 filename".into()))?;
-
-    let mut tar_bytes = Vec::<u8>::new();
-    {
-        let mut builder = Builder::new(&mut tar_bytes);
-        let mut header = Header::new_gnu();
-        header.set_size(payload.content.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-
-        builder
-            .append_data(
-                &mut header,
-                filename,
-                Cursor::new(payload.content.as_bytes()),
-            )
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("tar build: {e}"),
-                )
-            })?;
-
-        builder.finish().map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("tar finish: {e}"),
-            )
-        })?;
-    }
-
-    // Extract tar into the parent directory
-    let parent_dir = StdPath::new(&payload.path)
-        .parent()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "/".to_owned());
 
     let pods: Api<Pod> = Api::namespaced(ks.client.clone(), ns);
     let mut ap = AttachParams::default()
@@ -149,46 +91,50 @@ pub async fn kube_write_file_handler(
     }
 
     let mut attached = pods
-        .exec(
-            &name,
-            vec!["tar", "xf", "-", "-C", &parent_dir],
-            &ap,
-        )
+        .exec(&name, vec!["tar", "xf", "-", "-C", &parent_dir], &ap)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("exec tar xf: {e}")))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("exec tar xf: {e}"),
+            )
+        })?;
 
     // Write tar bytes to stdin, then close it to signal EOF
     {
-        let mut stdin = attached
-            .stdin()
-            .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "no stdin available".into()))?;
-        stdin
-            .write_all(&tar_bytes)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("stdin write: {e}")))?;
-        stdin
-            .shutdown()
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("stdin shutdown: {e}")))?;
+        let mut stdin = attached.stdin().ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "no stdin available".into(),
+            )
+        })?;
+        stdin.write_all(&tar_bytes).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("stdin write: {e}"),
+            )
+        })?;
+        stdin.shutdown().await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("stdin shutdown: {e}"),
+            )
+        })?;
     }
 
     // Read stderr for errors
     let mut stderr_bytes = Vec::new();
     if let Some(mut reader) = attached.stderr() {
-        reader
-            .read_to_end(&mut stderr_bytes)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("stderr read: {e}")))?;
+        reader.read_to_end(&mut stderr_bytes).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("stderr read: {e}"),
+            )
+        })?;
     }
 
     let status = attached.take_status().unwrap().await;
-    let exit_code = status
-        .and_then(|s| {
-            s.status
-                .as_ref()
-                .and_then(|st| if st == "Success" { Some(0) } else { None })
-        })
-        .unwrap_or(-1);
+    let exit_code = command_exit_code(status.as_ref());
 
     if exit_code != 0 {
         let stderr_str = String::from_utf8_lossy(&stderr_bytes);

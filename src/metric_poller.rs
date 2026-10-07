@@ -6,7 +6,10 @@ use futures_util::StreamExt;
 use crate::docker_state::{CpuSnapshot, DockerState};
 use crate::metric_registry::MetricRegistry;
 
-pub async fn poll_docker_metrics(docker_state: &Arc<DockerState>, metric_registry: &MetricRegistry) {
+pub async fn poll_docker_metrics(
+    docker_state: &Arc<DockerState>,
+    metric_registry: &MetricRegistry,
+) {
     if let Ok(containers) = docker_state
         .docker
         .list_containers(Some(ListContainersOptions {

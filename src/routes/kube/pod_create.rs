@@ -17,6 +17,7 @@ use crate::app_state::AppState;
         content_type = "application/json"
     ),
     responses(
+        (status = 503, description = "Enabled backend is unavailable", body = crate::routes::shared::health::BackendHealth),
         (status = 201, description = "Pod created", body = Object),
         (status = 400, description = "Invalid manifest"),
         (status = 500, description = "Internal server error"),
@@ -38,8 +39,12 @@ pub async fn create_pod_handler(
 
     let pods: Api<Pod> = Api::namespaced(ks.client.clone(), ns);
 
-    let pod: Pod = serde_json::from_value(manifest)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid pod manifest: {e}")))?;
+    let pod: Pod = serde_json::from_value(manifest).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid pod manifest: {e}"),
+        )
+    })?;
 
     let created = pods
         .create(&PostParams::default(), &pod)

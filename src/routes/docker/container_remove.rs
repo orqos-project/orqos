@@ -24,6 +24,7 @@ pub struct RemoveContainerRequest {
     ),
     request_body(content = RemoveContainerRequest, description = "Options", content_type = "application/json"),
     responses(
+        (status = 503, description = "Enabled backend is unavailable", body = crate::routes::shared::health::BackendHealth),
         (status = 204, description = "Container removed successfully"),
         (status = 404, description = "Container not found"),
         (status = 500, description = "Internal server error")
@@ -44,9 +45,9 @@ pub async fn remove_container_handler(
 
     match remove_container(docker, &container_id, force, v).await {
         Ok(()) => StatusCode::NO_CONTENT,
-        Err(BollardError::DockerResponseServerError { status_code, .. }) if status_code == 404 => {
-            StatusCode::NOT_FOUND
-        }
+        Err(BollardError::DockerResponseServerError {
+            status_code: 404, ..
+        }) => StatusCode::NOT_FOUND,
         Err(e) => {
             tracing::error!("failed to remove container {container_id}: {e}");
             StatusCode::INTERNAL_SERVER_ERROR

@@ -3,6 +3,7 @@ use std::{sync::Arc, time::Duration};
 
 use crate::app_state::AppState;
 
+#[utoipa::path(get, path = "/metrics", responses((status = 200, description = "Docker metrics in Prometheus text format", body = String, content_type = "text/plain")), tag = "Streaming")]
 pub async fn metrics_handler(State(app): State<Arc<AppState>>) -> impl IntoResponse {
     let mut out = String::new();
     for entry in app.metric_registry.cpu.iter() {

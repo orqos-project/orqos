@@ -27,6 +27,7 @@ pub struct ContainerQuery {
     path = "/docker/containers",
     params(ContainerQuery),
     responses(
+        (status = 503, description = "Enabled backend is unavailable", body = crate::routes::shared::health::BackendHealth),
         (status = 200, body = Object)
     ),
     tag = "Docker Containers",

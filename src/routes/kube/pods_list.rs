@@ -26,6 +26,7 @@ pub struct KubePodQuery {
     path = "/kube/pods",
     params(KubePodQuery),
     responses(
+        (status = 503, description = "Enabled backend is unavailable", body = crate::routes::shared::health::BackendHealth),
         (status = 200, body = Object)
     ),
     tag = "Kube Pods",

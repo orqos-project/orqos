@@ -24,6 +24,7 @@ pub struct KubeNamespaceQuery {
         KubeNamespaceQuery,
     ),
     responses(
+        (status = 503, description = "Enabled backend is unavailable", body = crate::routes::shared::health::BackendHealth),
         (status = 204, description = "Pod deleted"),
         (status = 404, description = "Pod not found"),
         (status = 500, description = "Internal server error"),
