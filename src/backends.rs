@@ -5,6 +5,7 @@ use kube::{Client, Config};
 
 #[derive(Clone, Copy, Debug)]
 pub struct BackendSelection {
+    pub host: bool,
     pub docker: bool,
     pub kube: bool,
 }
@@ -13,18 +14,26 @@ impl BackendSelection {
     pub fn parse(value: &str) -> Result<Self, String> {
         match value {
             "docker" => Ok(Self {
+                host: false,
                 docker: true,
                 kube: false,
             }),
             "kube" => Ok(Self {
+                host: false,
                 docker: false,
                 kube: true,
             }),
             "both" => Ok(Self {
+                host: false,
                 docker: true,
                 kube: true,
             }),
-            _ => Err("ORQOS_BACKENDS must be docker, kube, or both".into()),
+            "host" => Ok(Self {
+                host: true,
+                docker: false,
+                kube: false,
+            }),
+            _ => Err("ORQOS_BACKENDS must be host, docker, kube, or both".into()),
         }
     }
 }
@@ -85,6 +94,8 @@ mod tests {
 
     #[test]
     fn backend_modes_are_explicit() {
+        let host = BackendSelection::parse("host").unwrap();
+        assert!(host.host && !host.docker && !host.kube);
         let docker = BackendSelection::parse("docker").unwrap();
         assert!(docker.docker && !docker.kube);
         let kube = BackendSelection::parse("kube").unwrap();

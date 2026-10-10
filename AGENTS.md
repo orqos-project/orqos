@@ -1,5 +1,11 @@
 # Repository Guidelines
 
+## Native Host MVP Handoff
+
+For RawPair native host work, read `../rawpair/goal.txt`, `../rawpair/docs/HANDOFF.md`, and `docs/HOST_BACKEND.md` first. RawPair's goal is the canonical brief. The native implementation and API are described in `docs/HOST_API.md`; `docs/HOST_BACKEND.md` preserves the original design brief. Preserve the existing Docker/Kubernetes contracts and coordinate the host API with RawPair.
+
+The user explicitly requires a delivered, integrated MVP and usable operator setup. Builds, automated tests, CI, live checks, local deployment, and user acceptance are best-effort evidence, not completion preconditions for this milestone. Run useful checks when practical and fix discovered defects; report unverified behavior honestly. Missing core implementation still means unfinished work. This user policy governs the host milestone.
+
 ## Project Structure & Module Organization
 
 Orqos is a single-binary Rust 2021 daemon exposing an Axum HTTP/WebSocket API for Docker/Podman containers and Kubernetes pods.
@@ -7,7 +13,7 @@ Orqos is a single-binary Rust 2021 daemon exposing an Axum HTTP/WebSocket API fo
 - `src/main.rs` initializes backends, background tasks, and HTTP serving; `src/router.rs` mounts routes for available backends.
 - `src/routes/docker/` and `src/routes/kube/` contain backend handlers; `src/routes/shared/` contains metrics and event/stat streams.
 - `app_state.rs`, `docker_state.rs`, and `kube_state.rs` hold shared and backend state. Metrics polling, storage, and event fanout live in dedicated `src/` modules.
-- `.github/workflows/rust.yml` builds release artifacts. There are currently no test or asset directories. Swagger UI is generated at `/swagger`.
+- CI builds release artifacts and runs push/PR checks. Regression tests live beside their Rust modules; live smoke checks are in `scripts/smoke.py`. Swagger UI is generated at `/swagger/`.
 
 ## Build, Test, and Development Commands
 
@@ -18,7 +24,7 @@ Run commands from the repository root:
 - `cargo build --release --target x86_64-unknown-linux-gnu` — reproduce the release CI build; install the target with `rustup target add x86_64-unknown-linux-gnu` first.
 - `cargo fmt --check` — check formatting; use `cargo fmt` to apply it.
 - `cargo clippy` — run Rust lint checks.
-- `cargo test` — run tests once added.
+- `cargo test --locked` — run the existing regression tests.
 
 ## Coding Style & Naming Conventions
 
@@ -28,7 +34,7 @@ Keep backend logic in its corresponding route directory and shared infrastructur
 
 ## Testing Guidelines
 
-No tests or coverage threshold are configured; CI currently builds only on published releases. Add Rust unit tests in module-local `#[cfg(test)]` blocks, using `#[test]` or `#[tokio::test]` for asynchronous behavior. Use descriptive names such as `rejects_parent_directory_traversal`. Cover validation, error responses, and changed behavior. Document backend setup and cleanup for tests requiring containers or pods.
+Existing module-local regression tests and push/PR CI cover the container backends. Add focused Rust tests where useful, using `#[test]` or `#[tokio::test]` for asynchronous behavior and descriptive names such as `rejects_parent_directory_traversal`. Document setup and cleanup for checks requiring live backends. For the native host milestone, follow the best-effort validation policy above; test or live-check execution is not a completion gate.
 
 ## Commit & Pull Request Guidelines
 

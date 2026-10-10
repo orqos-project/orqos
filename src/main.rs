@@ -1,6 +1,7 @@
 pub mod app_state;
 pub mod backends;
 pub mod docker_state;
+pub mod host;
 pub mod kube_state;
 pub mod metric_poller;
 pub mod metric_registry;
@@ -41,6 +42,11 @@ async fn main() -> Result<()> {
     let backends =
         BackendSelection::parse(&env::var("ORQOS_BACKENDS").unwrap_or_else(|_| "both".into()))
             .map_err(anyhow::Error::msg)?;
+    let host = if backends.host {
+        Some(Arc::new(crate::host::HostState::from_env().await?))
+    } else {
+        None
+    };
     let docker_result = if backends.docker {
         connect_docker()
     } else {
@@ -83,11 +89,13 @@ async fn main() -> Result<()> {
         }
     }
     if let (Err(docker_error), Err(kube_error)) = (docker_probe, kube_probe) {
-        anyhow::bail!(
-            "No enabled backend is reachable: Docker: {}; Kubernetes: {}",
-            docker_error,
-            kube_error
-        );
+        if !backends.host {
+            anyhow::bail!(
+                "No enabled backend is reachable: Docker: {}; Kubernetes: {}",
+                docker_error,
+                kube_error
+            );
+        }
     }
 
     // Shared broadcast channels
@@ -119,6 +127,7 @@ async fn main() -> Result<()> {
     let metric_registry = MetricRegistry::default();
 
     let app_state = Arc::new(AppState {
+        host,
         backends,
         docker_error,
         kube_error,
@@ -130,9 +139,36 @@ async fn main() -> Result<()> {
     });
 
     let router = build_router(app_state.clone());
+    // Reconcile stopped/failed runtime resources after daemon restart and exits.
+    // Workspaces remain running when this daemon is stopped.
+    let host_reconciler = app_state.host.clone().map(|host| {
+        tokio::spawn(async move {
+            loop {
+                match host
+                    .call(serde_json::json!({"operation":"reconcile"}))
+                    .await
+                {
+                    Ok(result) => {
+                        if result["errors"].as_array().is_some_and(|v| !v.is_empty()) {
+                            warn!(%result, "Native workspace reconciliation needs attention");
+                        }
+                    }
+                    Err((_, error)) => warn!(error = %error.0, "Native reconciliation failed"),
+                }
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            }
+        })
+    });
 
     // Serve HTTP
     let bind_addr = env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".into());
+    if backends.host {
+        let address: std::net::SocketAddr = bind_addr.parse()?;
+        anyhow::ensure!(
+            address.ip().is_loopback(),
+            "Host control API must bind a loopback address"
+        );
+    }
     let listener = TcpListener::bind(&bind_addr).await?;
     tracing::info!("Listening on {}", bind_addr);
 
@@ -185,6 +221,9 @@ async fn main() -> Result<()> {
         }
     }
 
+    if let Some(handle) = host_reconciler {
+        handle.abort();
+    }
     metric_handle.abort();
     if let Err(e) = metric_handle.await {
         warn!(?e, "metric polling task aborted while shutting down");

@@ -26,7 +26,12 @@ use crate::routes::shared::stats_ws::stats_ws;
 #[derive(OpenApi)]
 #[openapi(
     info(description = "Orqos API"),
+    modifiers(&HostSecurity),
     paths(
+        crate::host::inventory,
+        crate::host::list,
+        crate::host::inspect,
+        crate::host::action,
         crate::routes::docker::containers_list::list_containers_handler,
         crate::routes::docker::container_stop::stop_container_handler,
         crate::routes::docker::container_remove::remove_container_handler,
@@ -50,12 +55,32 @@ use crate::routes::shared::stats_ws::stats_ws;
 )]
 struct ApiDoc;
 
+struct HostSecurity;
+impl utoipa::Modify for HostSecurity {
+    fn modify(&self, doc: &mut utoipa::openapi::OpenApi) {
+        if let Some(components) = doc.components.as_mut() {
+            components.add_security_scheme(
+                "host_bearer",
+                utoipa::openapi::security::SecurityScheme::Http(
+                    utoipa::openapi::security::Http::new(
+                        utoipa::openapi::security::HttpAuthScheme::Bearer,
+                    ),
+                ),
+            );
+        }
+    }
+}
+
 pub(crate) fn build_router(app: Arc<AppState>) -> Router {
     let mut router = Router::new()
         .route("/healthz", get(health_handler))
         .route("/metrics", get(metrics_handler))
         .route("/events/ws", get(events_ws))
         .route("/stats/ws", get(stats_ws));
+
+    if app.backends.host {
+        router = router.merge(crate::host::routes(app.clone()));
+    }
 
     if app.backends.docker {
         let docker = Router::new()

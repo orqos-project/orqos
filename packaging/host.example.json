@@ -1,0 +1,22 @@
+{
+  "subnet": "10.231.0.0/16",
+  "dns": ["1.1.1.1", "9.9.9.9"],
+  "slots": {
+    "project-a": {
+      "label": "Project A account",
+      "user": "rp-project-a",
+      "home": "/srv/rawpair/project-a",
+      "project": "/srv/rawpair/project-a/project",
+      "index": 1,
+      "limits": {"cpu_percent": 200, "memory_mb": 2048, "tasks": 512}
+    },
+    "project-b": {
+      "label": "Project B account",
+      "user": "rp-project-b",
+      "home": "/srv/rawpair/project-b",
+      "project": "/srv/rawpair/project-b/project",
+      "index": 2,
+      "limits": {"cpu_percent": 200, "memory_mb": 2048, "tasks": 512}
+    }
+  }
+}

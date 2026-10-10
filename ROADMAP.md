@@ -16,7 +16,17 @@ The MVP supports Docker/Podman containers and Kubernetes pods. [Local evidence](
 
 ## Next
 
-Run the new checks in hosted CI when this branch is pushed. Keep the smoke suite as the acceptance gate for API changes. Validate a Podman Unix socket before claiming equivalent runtime coverage.
+Deliver the [native host backend for RawPair](docs/HOST_BACKEND.md), coordinated by [RawPair goal.txt](../rawpair/goal.txt). This is a new implementation milestone; current container validation does not establish host support.
+
+- [ ] Explicit host-only startup without Docker or Kubernetes prerequisites.
+- [ ] Owned native workspace lifecycle, Unix identities, systemd supervision, and resource limits.
+- [ ] Per-workspace network namespaces, DNS/outbound access, and scoped cleanup.
+- [ ] Safe native file operations and protected terminal/application forwarding.
+- [ ] RawPair integration and usable native setup/service assets.
+
+For this milestone, checks are best effort and are not completion gates. Completion requires the actual integrated MVP and operator handoff; the user will build, deploy locally, and use it afterward.
+
+Continue maintaining the existing container checks and validate a Podman Unix socket before claiming equivalent runtime coverage.
 
 ## Later
 

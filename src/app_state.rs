@@ -8,6 +8,7 @@ use crate::kube_state::KubeState;
 use crate::metric_registry::MetricRegistry;
 
 pub struct AppState {
+    pub host: Option<Arc<crate::host::HostState>>,
     pub backends: BackendSelection,
     pub docker_error: Option<String>,
     pub kube_error: Option<String>,

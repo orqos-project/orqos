@@ -1,0 +1,25 @@
+[Unit]
+Description=Orqos authenticated native workspace control
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+Environment=ORQOS_BACKENDS=host
+Environment=BIND_ADDR=127.0.0.1:9080
+EnvironmentFile=/etc/orqos/host.env
+ExecStart=/usr/local/bin/orqos
+WorkingDirectory=/var/lib/orqos
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=yes
+# Do not create a private mount namespace here: ip netns handles must be
+# visible to PID 1 and the independently supervised workspace services.
+PrivateMounts=no
+PrivateTmp=no
+
+[Install]
+WantedBy=multi-user.target

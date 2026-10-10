@@ -1,3 +1,7 @@
+# Native host workspaces
+
+Native Linux workspace mode is available with `ORQOS_BACKENDS=host`. See [HOST_API.md](docs/HOST_API.md) for the authenticated API, ownership model, account provisioning and setup. Docker/Kubernetes modes remain available as described below.
+
 # Orqos
 
 **Orqos** is a small Rust daemon that manages Docker/Podman containers and Kubernetes pods through an HTTP/WebSocket API.
@@ -5,6 +9,8 @@
 It provides lifecycle operations, command execution, file transfer, and event streams. Docker also supplies metrics and stats. Backend routes are mounted according to startup configuration.
 
 The core MVP is validated locally on Docker Desktop and Kubernetes. See the [assessment](docs/ASSESSMENT.md) for evidence and limits, and the [roadmap](ROADMAP.md) for priorities.
+
+A native Linux host backend for RawPair is planned, not implemented. See [the host backend plan](docs/HOST_BACKEND.md) and the canonical [RawPair goal](../rawpair/goal.txt). The new milestone covers systemd-supervised workspaces, Unix identities, network namespaces, safe file access, and internal terminal/application forwarding. Its build and test checks are best effort rather than goal-completion gates. The commands and backend modes below describe the existing container API.
 
 ## Local Development
 
@@ -50,6 +56,6 @@ Run `cargo fmt --check`, `cargo test --locked`, and `cargo clippy --locked --all
 
 ## Use Cases
 
-* Used by [RawPair](https://github.com/rawpair/rawpair) to start per-user development containers
+* Planned execution layer for [RawPair](https://github.com/rawpair/rawpair)'s native host workspaces. The current RawPair checkout manages Docker directly; it does not yet call Orqos.
 * Used by [Rezn](https://github.com/rezn-project/rezn) as the execution layer for declarative container orchestration
 * Can be embedded in CI runners, custom PaaS setups, or your own tools

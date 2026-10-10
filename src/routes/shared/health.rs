@@ -38,6 +38,8 @@ pub struct HealthResponse {
     pub status: &'static str,
     pub docker: BackendHealth,
     pub kube: BackendHealth,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<BackendHealth>,
 }
 
 impl HealthResponse {
@@ -47,6 +49,7 @@ impl HealthResponse {
             status: if healthy { "ok" } else { "degraded" },
             docker,
             kube,
+            host: None,
         }
     }
     fn status_code(&self) -> StatusCode {
@@ -90,7 +93,19 @@ async fn kube_health(app: &AppState) -> BackendHealth {
 )]
 pub async fn health_handler(State(app): State<Arc<AppState>>) -> impl IntoResponse {
     let (docker, kube) = tokio::join!(docker_health(&app), kube_health(&app));
-    let response = HealthResponse::new(docker, kube);
+    let mut response = HealthResponse::new(docker, kube);
+    if let Some(host) = &app.host {
+        let result = host
+            .call(serde_json::json!({"operation":"health"}))
+            .await
+            .map(|_| ())
+            .map_err(|(_, body)| body.0.to_string());
+        let health = BackendHealth::new(true, result);
+        if !health.available {
+            response.status = "degraded";
+        }
+        response.host = Some(health);
+    }
     (response.status_code(), Json(response))
 }
 
