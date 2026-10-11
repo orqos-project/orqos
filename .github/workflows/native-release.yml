@@ -47,8 +47,10 @@ jobs:
           sudo orqos-host-admin provision project-a
           sudo test ! -e /srv/rawpair/project-a/orqos-skeleton-must-not-copy
           sudo orqos-host-admin provision project-a
+          sudo orqos-host-admin provision project-b
           sudo orqos-host-admin validate
           sudo systemctl enable --now orqos-host
+          sudo -H env GITHUB_ACTIONS=true python3 packaging/runtime-smoke.py
           sudo apt-get install -y --reinstall "$PWD"/dist/*.deb
           sudo orqos-host-admin validate
           sudo apt-get remove -y orqos-host
