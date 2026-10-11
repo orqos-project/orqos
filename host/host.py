@@ -276,9 +276,13 @@ def setup_network(record, config):
     link, peer, table = record['link'], 'guest0', nft_name(record)
     if run('ip', 'link', 'show', link, check=False).returncode == 0:
         raise RuntimeError('Refusing preexisting virtual link')
-    # Alias is set in the creation request, avoiding an unlabelled host link.
+    # Some supported veth/kernel combinations ignore an alias in the creation
+    # request. Set and verify it explicitly before exposing the interface.
     run('ip', 'link', 'add', link, 'alias', 'orqos:' + record['token'], 'type', 'veth',
         'peer', 'name', peer, 'netns', name)
+    run('ip', 'link', 'set', 'dev', link, 'alias', 'orqos:' + record['token'])
+    if not host_link(record):
+        raise RuntimeError('New workspace virtual link disappeared')
     run('ip', 'addr', 'add', host + '/30', 'dev', link)
     run('ip', 'link', 'set', link, 'up')
     for args in [('link', 'set', 'lo', 'up'), ('addr', 'add', guest + '/30', 'dev', peer),
