@@ -33,6 +33,7 @@ jobs:
       - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
       - run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev dpkg-dev
       - run: cargo test --locked
+      - run: python3 -m unittest discover -s host -p 'test_*.py' -v
       - run: python3 -m unittest discover -s packaging -p 'test_*.py' -v
       - run: cargo build --release --locked
       - name: Package and check installation lifecycle

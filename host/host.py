@@ -276,8 +276,8 @@ def setup_network(record, config):
     link, peer, table = record['link'], 'guest0', nft_name(record)
     if run('ip', 'link', 'show', link, check=False).returncode == 0:
         raise RuntimeError('Refusing preexisting virtual link')
-    # Some supported veth/kernel combinations ignore an alias in the creation
-    # request. Set and verify it explicitly before exposing the interface.
+    # Apply the ownership alias with a dedicated link update and verify it
+    # before exposing the interface. Creation alone did not retain it in CI.
     run('ip', 'link', 'add', link, 'alias', 'orqos:' + record['token'], 'type', 'veth',
         'peer', 'name', peer, 'netns', name)
     run('ip', 'link', 'set', 'dev', link, 'alias', 'orqos:' + record['token'])
@@ -375,7 +375,10 @@ def start(record, config):
         command += ['--setenv=PATH=' + record['home'] + '/.local/bin:' + record['home'] + '/.cargo/bin:' + record['home'] + '/bin:/usr/local/bin:/usr/bin:/bin', '--setenv=LANG=C.UTF-8', '--setenv=SHELL=/bin/bash',
                     '--setenv=TERM=xterm-256color', '/usr/bin/python3',
                     '/usr/lib/orqos/workspace.py', str(SPECS / (record['id'] + '.json'))]
-        run(*command)
+        try:
+            run(*command)
+        except RuntimeError as error:
+            raise RuntimeError('Workspace service did not start; journalctl -u ' + record['unit']) from error
         for _ in range(60):
             status = observation(record)
             if status['status'] == 'failed':
