@@ -1,3 +1,5 @@
 /target
 .vscode
 .idea
+/dist/
+__pycache__/

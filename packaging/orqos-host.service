@@ -3,6 +3,9 @@ Description=Orqos authenticated native workspace control
 After=network-online.target
 Wants=network-online.target
 
+ConditionPathExists=/etc/orqos/host.env
+ConditionPathExists=/etc/orqos/host.json
+
 [Service]
 Type=simple
 User=root
@@ -10,7 +13,7 @@ Group=root
 Environment=ORQOS_BACKENDS=host
 Environment=BIND_ADDR=127.0.0.1:9080
 EnvironmentFile=/etc/orqos/host.env
-ExecStart=/usr/local/bin/orqos
+ExecStart=/usr/bin/orqos
 WorkingDirectory=/var/lib/orqos
 Restart=on-failure
 RestartSec=3

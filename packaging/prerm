@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+case "${1:-}" in
+  remove|deconfigure)
+    # Stop control first to prevent another launch during removal.
+    if [ -d /run/systemd/system ]; then systemctl stop orqos-host.service; fi
+    # Abort removal if an owned workspace cannot be safely stopped.
+    /usr/bin/orqos-host-admin stop-all
+    if [ -d /run/systemd/system ]; then systemctl disable orqos-host.service || true; fi
+    ;;
+  upgrade)
+    if [ -d /run/systemd/system ]; then systemctl stop orqos-host.service; fi
+    ;;
+esac

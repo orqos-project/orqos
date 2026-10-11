@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+if [ ! -f /var/lib/orqos/package-owner ]; then
+  for path in /usr/local/bin/orqos /usr/bin/orqos /usr/lib/orqos /etc/orqos/host.json /etc/orqos/host.env /etc/systemd/system/orqos-host.service /var/lib/orqos/host; do
+    if [ -e "$path" ] || [ -L "$path" ]; then
+      echo "Existing Orqos installation at $path. Back up and migrate explicitly; see docs/PACKAGES.md." >&2
+      exit 1
+    fi
+  done
+fi
+# Control restart never stops independently supervised workspace services.
+if [ -d /run/systemd/system ] && systemctl cat orqos-host.service >/dev/null 2>&1; then systemctl stop orqos-host.service; fi

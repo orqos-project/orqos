@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+[ "${1:-}" = configure ] || exit 0
+install -d -o root -g root -m 0755 /etc/orqos
+install -d -o root -g root -m 0700 /var/lib/orqos /var/lib/orqos/host
+printf '%s\n' orqos-host-v1 > /var/lib/orqos/package-owner
+chmod 0600 /var/lib/orqos/package-owner
+if [ -d /run/systemd/system ]; then systemctl daemon-reload; fi
+printf '%s\n' 'Orqos installed and stopped. Run: sudo orqos-host-admin init'

@@ -1,5 +1,7 @@
 # Native host workspaces
 
+Native Ubuntu 24.04 packages and standalone provisioning: [PACKAGES.md](docs/PACKAGES.md). RawPair can install an exact tested Orqos partner through its native metapackage.
+
 Native Linux workspace mode is available with `ORQOS_BACKENDS=host`. See [HOST_API.md](docs/HOST_API.md) for the authenticated API, ownership model, account provisioning and setup. Docker/Kubernetes modes remain available as described below.
 
 # Orqos

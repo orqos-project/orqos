@@ -3,8 +3,9 @@ name: Rust
 on:
   push:
   pull_request:
-  release:
-    types: [published]
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -12,7 +13,7 @@ env:
 
 jobs:
   checks:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
     - uses: actions/checkout@v4
     - name: Install pinned Rust toolchain
@@ -29,21 +30,3 @@ jobs:
       run: docker --context default pull alpine:3.22
     - name: Docker smoke checks
       run: python3 scripts/smoke.py --backend docker --docker-context default
-  build:
-    if: github.event_name == 'release'
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v4
-    - name: Install pinned release toolchain
-      run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --target x86_64-unknown-linux-gnu
-    - name: Build
-      run: cargo build --locked --verbose --release --target x86_64-unknown-linux-gnu
-    - name: Rename release binary
-      run: mv target/x86_64-unknown-linux-gnu/release/orqos target/x86_64-unknown-linux-gnu/release/orqos-x86_64-unknown-linux-gnu
-    - name: Upload release artifacts
-      uses: softprops/action-gh-release@v2
-      with:
-        files: |
-          target/x86_64-unknown-linux-gnu/release/orqos-x86_64-unknown-linux-gnu
-      env:
-        GITHUB_TOKEN: ${{ secrets.GH_PAT }}

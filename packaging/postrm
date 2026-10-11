@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+# Preserve inventory, token, ownership records, provisioning journal and all homes.
+if [ -d /run/systemd/system ]; then systemctl daemon-reload; fi
