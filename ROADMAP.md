@@ -1,6 +1,6 @@
 # Roadmap
 
-The MVP supports Docker/Podman containers and Kubernetes pods. [Local evidence](docs/ASSESSMENT.md) and [repeatable smoke checks](docs/SMOKE.md) cover the core Docker/Kubernetes workflows.
+The MVP supports native Linux workspaces, Docker/Podman containers and Kubernetes pods. [Local evidence](docs/ASSESSMENT.md) and [repeatable smoke checks](docs/SMOKE.md) cover the core Docker/Kubernetes workflows.
 
 ## Core MVP
 
@@ -14,17 +14,19 @@ The MVP supports Docker/Podman containers and Kubernetes pods. [Local evidence](
 - [x] Regression tests, push/PR CI configuration, and OpenAPI coverage.
 - [x] Local lifecycle, exec, file-transfer, startup/failure, and cleanup smoke checks.
 
-## Next
+## Native host milestone: implemented
 
-Deliver the [native host backend for RawPair](docs/HOST_BACKEND.md), coordinated by [RawPair goal.txt](../rawpair/goal.txt). This is a new implementation milestone; current container validation does not establish host support.
+The [native host API](docs/HOST_API.md) is integrated with RawPair. The [package guide](docs/PACKAGES.md) covers standalone initialization, provisioning and source installation; RawPair's paired installer configures the complete browser experience.
 
-- [ ] Explicit host-only startup without Docker or Kubernetes prerequisites.
-- [ ] Owned native workspace lifecycle, Unix identities, systemd supervision, and resource limits.
-- [ ] Per-workspace network namespaces, DNS/outbound access, and scoped cleanup.
-- [ ] Safe native file operations and protected terminal/application forwarding.
-- [ ] RawPair integration and usable native setup/service assets.
+- [x] Explicit host-only startup without Docker or Kubernetes prerequisites.
+- [x] Owned native workspace lifecycle, Unix identities, systemd supervision and resource limits.
+- [x] Per-workspace network namespaces, DNS/outbound access and scoped cleanup.
+- [x] Safe native file operations and protected terminal/application forwarding.
+- [x] RawPair integration, native setup/service assets and Ubuntu package/release pipelines.
 
-For this milestone, checks are best effort and are not completion gates. Completion requires the actual integrated MVP and operator handoff; the user will build, deploy locally, and use it afterward.
+## Next validation and release work
+
+Build and review the first native release, then publish the pinned Orqos partner before RawPair's paired release. Run the configured Ubuntu 24.04 amd64/arm64 package lifecycle and privileged network checks, and complete interactive browser/wizard acceptance. [RawPair's package handoff](https://github.com/rawpair/rawpair/blob/main/docs/PACKAGE_HANDOFF.md) distinguishes implemented paths from checks actually run.
 
 Continue maintaining the existing container checks and validate a Podman Unix socket before claiming equivalent runtime coverage.
 

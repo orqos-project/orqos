@@ -1,8 +1,8 @@
-> Implementation: native host mode is now implemented. Read [HOST_API.md](HOST_API.md) for the concrete API and setup. The design brief below records the original requirements.
+> Historical design brief, recorded 2026-10-10. Native mode is implemented; the future-tense text below preserves the original requirements. For current installation use [PACKAGES.md](PACKAGES.md); for the implemented contract use [HOST_API.md](HOST_API.md).
 
 # Native host backend for RawPair
 
-Orqos will provide the execution layer for RawPair's native Linux development workspaces. The feature is planned as of 2026-10-10; current Orqos supports Docker/Podman and Kubernetes only. The canonical scope and delivery policy are [RawPair goal.txt](../../rawpair/goal.txt), [the product plan](../../rawpair/docs/HOST_MVP.md), and [the session handoff](../../rawpair/docs/HANDOFF.md).
+Orqos will provide the execution layer for RawPair's native Linux development workspaces. The feature is planned as of 2026-10-10; current Orqos supports Docker/Podman and Kubernetes only. The canonical scope and delivery policy are [RawPair goal.txt](https://github.com/rawpair/rawpair/blob/main/goal.txt), [the product plan](https://github.com/rawpair/rawpair/blob/main/docs/HOST_MVP.md), and [the session handoff](https://github.com/rawpair/rawpair/blob/main/docs/HANDOFF.md).
 
 The user wants a delivered implementation and usable setup, with checks performed as far as practical and hands-on deployment/use afterward. Builds, tests, CI, and live checks are best-effort evidence, not completion gates. Existing assessment and smoke results establish container-backend behavior only.
 
