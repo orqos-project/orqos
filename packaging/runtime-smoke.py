@@ -77,4 +77,8 @@ if __name__ == '__main__':
             subprocess.run(['journalctl', '-u', record['unit'], '--no-pager', '-n', '50'])
             subprocess.run(['systemctl', 'show', record['unit'], '--property=Result,ExecMainStatus,ActiveState'])
             subprocess.run(['ip', '-j', 'link', 'show', record['link']])
+            subprocess.run(['ip', '-d', '-j', 'link', 'show', record['link']])
+            alias = Path('/sys/class/net', record['link'], 'ifalias')
+            if alias.exists():
+                print('Kernel interface alias:', repr(alias.read_text()), flush=True)
         raise

@@ -119,8 +119,12 @@ def provision(name):
     slot = journal[name]['slot']
     if any(slot['index'] == x['index'] for x in config['slots'].values()):
         raise ValueError('Pending network index is now assigned; inspect provisioning journal')
-    Path('/srv/rawpair').mkdir(mode=0o755, parents=True, exist_ok=True)
+    workspace_base = Path('/srv/rawpair')
+    workspace_base.mkdir(mode=0o755, parents=True, exist_ok=True)
     host.protected('/srv/rawpair', True)
+    # The administration umask is 0077; users still need to traverse the
+    # root-owned parent to reach their individually protected workspace homes.
+    workspace_base.chmod(0o755)
     try:
         user = pwd.getpwnam(account)
     except KeyError:
