@@ -12,15 +12,15 @@ Open [Orqos Releases](https://github.com/orqos-project/orqos/releases) and choos
 
 ## Download and install
 
-Run as your ordinary sudo-capable user. This example uses the initial native tag `v0.2.0`; choose a published tag and matching package version from its asset list if different. `dpkg --print-architecture` must report `amd64` or `arm64`.
+Run as your ordinary sudo-capable user. This example uses the native tag `v0.2.1`; choose a published tag and matching package version from its asset list if different. `dpkg --print-architecture` must report `amd64` or `arm64`.
 
 ```sh
 sudo apt update
 sudo apt install -y ca-certificates curl python3
 mkdir -p ~/orqos-install
 cd ~/orqos-install
-ORQOS_TAG=v0.2.0
-ORQOS_VERSION=0.2.0
+ORQOS_TAG=v0.2.1
+ORQOS_VERSION=0.2.1
 ORQOS_ARCH=$(dpkg --print-architecture)
 ORQOS_PACKAGE="orqos-host_${ORQOS_VERSION}_${ORQOS_ARCH}.deb"
 ORQOS_BASE="https://github.com/orqos-project/orqos/releases/download/$ORQOS_TAG"
@@ -121,17 +121,17 @@ Maintainers: set `Cargo.toml` and its lockfile package version together; tag `vM
 From a reviewed checkout containing the intended version, tag and push the release:
 
 ```sh
-ORQOS_TAG=v0.2.0  # use the version recorded in Cargo.toml and Cargo.lock
+ORQOS_TAG=v0.2.1  # use the version recorded in Cargo.toml and Cargo.lock
 git tag "$ORQOS_TAG"
 git push origin "$ORQOS_TAG"
 ```
 
-To retry, open **Actions → Native Ubuntu release (draft) → Run workflow** and enter the exact existing tag. The workflow checks out that tag. Wait for both architecture builds and the release job, review the draft's `.deb` packages, retained binaries, manifest, checksums and attestations, and inspect installation/lifecycle logs. Publish manually only after review; the workflow refuses to modify a published release. RawPair's compatibility manifest initially pins `v0.2.0`, so publish that partner before building RawPair's paired release. See [RawPair's release procedure](https://github.com/rawpair/rawpair/blob/main/docs/RELEASING.md).
+To retry, open **Actions → Native Ubuntu release (draft) → Run workflow** and enter the exact existing tag. The workflow checks out that tag. Wait for both architecture builds and the release job, review the draft's `.deb` packages, retained binaries, manifest, checksums and attestations, and inspect installation/lifecycle logs. Publish manually only after review; the workflow refuses to modify a published release. RawPair's compatibility manifest pins `v0.2.1`, so publish that partner before building RawPair's paired release. See [RawPair's release procedure](https://github.com/rawpair/rawpair/blob/main/docs/RELEASING.md).
 
 For local packaging after `cargo build --release --locked`:
 
 ```sh
-python3 packaging/build.py --tag v0.2.0 --arch amd64
+python3 packaging/build.py --tag v0.2.1 --arch amd64
 python3 -m unittest discover -s packaging -p 'test_*.py' -v
 ```
 
@@ -141,4 +141,6 @@ Checksums verify download integrity, not signatures. Optional provenance verific
 gh attestation verify orqos-host_VERSION_ARCH.deb --repo orqos-project/orqos
 ```
 
-RawPair's compatibility manifest initially requires the new `v0.2.0` native-package release. Publish that reviewed Orqos release before building the paired RawPair release. Implementing the workflow does not publish release assets; a maintainer must complete the process above. Live systemd/network checks require a disposable privileged Linux host; source/unit tests alone do not establish a running installation.
+RawPair's compatibility manifest requires the `v0.2.1` native-package release. Publish that reviewed Orqos release before building the paired RawPair release. Implementing the workflow does not publish release assets; a maintainer must complete the process above. Live systemd/network checks require a disposable privileged Linux host; source/unit tests alone do not establish a running installation.
+
+Workspace homes start empty, with only the owned project and local-tool directories. Provisioning does not copy the host’s `/etc/skel`; install any desired shell configuration deliberately.

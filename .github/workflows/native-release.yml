@@ -43,7 +43,9 @@ jobs:
           sudo apt-get install -y "$PWD"/dist/*.deb
           test ! -e /etc/orqos/host.env
           sudo orqos-host-admin init
+          sudo touch /etc/skel/orqos-skeleton-must-not-copy
           sudo orqos-host-admin provision project-a
+          sudo test ! -e /srv/rawpair/project-a/orqos-skeleton-must-not-copy
           sudo orqos-host-admin provision project-a
           sudo orqos-host-admin validate
           sudo systemctl enable --now orqos-host

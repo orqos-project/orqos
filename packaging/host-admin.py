@@ -83,7 +83,9 @@ def create_account(account, home):
     if group and (group.gr_gid < 1000 or group.gr_mem or any(user.pw_gid == group.gr_gid for user in pwd.getpwall())):
         raise ValueError('Pending workspace group is shared or unsuitable; refusing adoption')
     group_options = ['--gid', account] if group else ['--user-group']
-    host.run('useradd', '--create-home', '--home-dir', home, '--shell', '/usr/sbin/nologin',
+    # Provision the owned directories below. Host skeletons may be enormous or
+    # contain operator-specific files that do not belong in a shared workspace.
+    host.run('useradd', '--no-create-home', '--home-dir', home, '--shell', '/usr/sbin/nologin',
              '--expiredate', '1970-01-02', *group_options, account)
 
 
