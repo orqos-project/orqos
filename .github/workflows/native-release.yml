@@ -40,32 +40,40 @@ jobs:
         run: |
           python3 packaging/build.py --tag "$RELEASE_TAG" --arch ${{ matrix.arch }}
           cp target/release/orqos dist/orqos-${{ matrix.target }}
-          sudo apt-get -s install "$PWD"/dist/*.deb
-          sudo apt-get install -y "$PWD"/dist/*.deb
-          test ! -e /etc/orqos/host.env
-          sudo orqos-host-admin init
-          sudo touch /etc/skel/orqos-skeleton-must-not-copy
-          sudo orqos-host-admin provision project-a
-          sudo test ! -e /srv/rawpair/project-a/orqos-skeleton-must-not-copy
-          sudo orqos-host-admin provision project-a
-          sudo orqos-host-admin provision project-b
-          sudo orqos-host-admin validate
-          sudo systemctl enable --now orqos-host
-          sudo -H env GITHUB_ACTIONS=true python3 packaging/runtime-smoke.py
-          sudo apt-get install -y --reinstall "$PWD"/dist/*.deb
-          sudo orqos-host-admin validate
-          sudo apt-get remove -y orqos-host
-          sudo test -f /etc/orqos/host.json
-          sudo test -f /var/lib/orqos/provisioning.json
-          sudo test -d /srv/rawpair/project-a/project
+          bash packaging/check-install.sh "$PWD/dist"
       - uses: actions/upload-artifact@v4
         with:
           name: orqos-${{ matrix.arch }}
           path: |
             dist/*.deb
             dist/orqos-*-unknown-linux-gnu
-  release:
+  compatibility:
     needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-26.04
+          - arch: arm64
+            runner: ubuntu-26.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: orqos-${{ matrix.arch }}
+          path: dist
+      - name: Check Ubuntu 24.04 binaries on Ubuntu 26.04
+        run: |
+          sudo apt-get update
+          python3 -m unittest discover -s host -p 'test_*.py' -v
+          python3 -m unittest discover -s packaging -p 'test_*.py' -v
+          bash packaging/check-install.sh "$PWD/dist"
+  release:
+    needs: [build, compatibility]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -97,6 +105,6 @@ jobs:
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = true
           else
-            gh release create "$RELEASE_TAG" --verify-tag --draft --title "$RELEASE_TAG" --notes 'Native Ubuntu 24.04 packages and standalone binaries. Review both architectures before publishing. See docs/PACKAGES.md.'
+            gh release create "$RELEASE_TAG" --verify-tag --draft --title "$RELEASE_TAG" --notes 'Native Ubuntu 24.04 and 26.04 packages and standalone binaries. Built on 24.04 and checked on both releases and architectures. See docs/PACKAGES.md.'
           fi
           gh release upload "$RELEASE_TAG" dist/*.deb dist/orqos-*-unknown-linux-gnu dist/manifest.json dist/SHA256SUMS --clobber

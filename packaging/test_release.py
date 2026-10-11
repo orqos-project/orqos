@@ -29,6 +29,8 @@ class ReleaseTests(unittest.TestCase):
                 expected.update([name, binary])
             subprocess.run([sys.executable, str(ROOT / 'packaging/release.py'), '--tag', 'v0.2.0', '--output', str(output)], check=True)
             manifest = json.loads((output / 'manifest.json').read_text())
+            self.assertEqual(manifest['ubuntu'], '24.04')
+            self.assertEqual(manifest['ubuntu_versions'], ['24.04', '26.04'])
             names = [artifact['name'] for artifact in manifest['artifacts']]
             self.assertEqual(len(names), len(expected))
             self.assertEqual(set(names), expected)

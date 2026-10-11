@@ -18,7 +18,7 @@ Docker/Podman and Kubernetes APIs remain available for container integrations. Y
 
 For the complete collaborative experience, follow RawPair's [first-workspace walkthrough](https://github.com/rawpair/rawpair/blob/main/docs/FIRST_WORKSPACE.md). Serve a small page, edit it together, then try two projects on the same port. Share that guide with a teammate who would like to pair with you.
 
-Native `.deb` packages target **Ubuntu 24.04 amd64 and arm64**, with no Rust toolchain needed to install. Choose a [published native release](https://github.com/orqos-project/orqos/releases) containing `orqos-host` packages and `SHA256SUMS`. The pipeline is implemented; if the assets are absent, use the [source path](docs/PACKAGES.md#build-native-mode-from-source). RawPair users should use its paired installer instead of installing Orqos independently.
+Native `.deb` packages target **Ubuntu 24.04 and 26.04, amd64 and arm64**, with no Rust toolchain needed to install. Choose a [published native release](https://github.com/orqos-project/orqos/releases) containing `orqos-host` packages and `SHA256SUMS`. The pipeline is implemented; if the assets are absent, use the [source path](docs/PACKAGES.md#build-native-mode-from-source). RawPair users should use its paired installer instead of installing Orqos independently.
 
 ## Native mode
 

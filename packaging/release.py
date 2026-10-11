@@ -20,7 +20,8 @@ for arch in ('amd64', 'arm64'):
         raise ValueError('Missing standalone binary: ' + target)
 artifacts = sorted([*a.output.glob('*.deb'), *a.output.glob('orqos-*-unknown-linux-gnu')])
 (a.output / 'manifest.json').write_text(json.dumps({'schema': 1, 'tag': a.tag, 'version': version,
-                                                   'ubuntu': '24.04', 'architectures': ['amd64', 'arm64'],
+                                                   'ubuntu': '24.04', 'ubuntu_versions': ['24.04', '26.04'],
+                                                   'architectures': ['amd64', 'arm64'],
                                                    'artifacts': [{'name': path.name, 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()} for path in artifacts]}, indent=2) + '\n')
 files = sorted([*artifacts, a.output / 'manifest.json'])
 (a.output / 'SHA256SUMS').write_text(''.join(hashlib.sha256(path.read_bytes()).hexdigest() + '  ' + path.name + '\n' for path in files))

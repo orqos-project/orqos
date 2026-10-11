@@ -6,21 +6,21 @@ Use this guide to run the native execution service or build an integration with 
 
 ## Before you start
 
-Use **Ubuntu 24.04 amd64 or arm64**, booted with systemd/cgroup v2, with sudo access and internet access to GitHub and Ubuntu repositories. Reserve a non-overlapping private IPv4 `/16` for workspaces; the default is `10.231.0.0/16`. The daemon needs free loopback port **9080**, and workspace networking needs IPv4 forwarding plus outbound/reply permission in any existing host firewall.
+Use **Ubuntu 24.04 or 26.04, amd64 or arm64**, booted with systemd/cgroup v2, with sudo access and internet access to GitHub and Ubuntu repositories. Reserve a non-overlapping private IPv4 `/16` for workspaces; the default is `10.231.0.0/16`. The daemon needs free loopback port **9080**, and workspace networking needs IPv4 forwarding plus outbound/reply permission in any existing host firewall.
 
 Open [Orqos Releases](https://github.com/orqos-project/orqos/releases) and choose a published native release containing `orqos-host_VERSION_ARCH.deb` and `SHA256SUMS`. The pipeline is implemented, but its assets require a reviewed, published release. If those assets are absent, follow [source installation](#build-native-mode-from-source).
 
 ## Download and install
 
-Run as your ordinary sudo-capable user. This example uses the native tag `v0.2.2`; choose a published tag and matching package version from its asset list if different. `dpkg --print-architecture` must report `amd64` or `arm64`.
+Run as your ordinary sudo-capable user. This example uses the native tag `v0.2.3`; choose a published tag and matching package version from its asset list if different. `dpkg --print-architecture` must report `amd64` or `arm64`.
 
 ```sh
 sudo apt update
 sudo apt install -y ca-certificates curl python3
 mkdir -p ~/orqos-install
 cd ~/orqos-install
-ORQOS_TAG=v0.2.2
-ORQOS_VERSION=0.2.2
+ORQOS_TAG=v0.2.3
+ORQOS_VERSION=0.2.3
 ORQOS_ARCH=$(dpkg --print-architecture)
 ORQOS_PACKAGE="orqos-host_${ORQOS_VERSION}_${ORQOS_ARCH}.deb"
 ORQOS_BASE="https://github.com/orqos-project/orqos/releases/download/$ORQOS_TAG"
@@ -92,9 +92,11 @@ Upgrade stops the control daemon while replacing execution assets; independently
 
 Older manual installations and packages without this package's ownership marker are refused before file overwrite. Back up inventory, token, runtime ownership, database and workspace homes; stop the old deployment, archive its units and execution paths, then install fresh on another host or restore through an explicit operator-managed migration. Do not invent package ownership markers or remove persisted runtime records to bypass detection. Automatic migration is deferred. Source installs use `packaging/install-host.sh [SUBNET]` and the same administrator helpers, with a distinct source ownership marker; conversion to package ownership requires migration.
 
+Ubuntu 26.04 support starts with **v0.2.3**. Release binaries and packages are built on Ubuntu 24.04; CI installs those same files on both Ubuntu versions for both architectures. In schema-1 manifests, `ubuntu` records the build baseline and `ubuntu_versions` records supported runtimes. Older manifests without the list declare only their scalar Ubuntu version.
+
 ## Build native mode from source
 
-This is the standalone source path on Ubuntu 24.04. RawPair source users should follow its [integrated guide](https://github.com/rawpair/rawpair/blob/main/docs/NATIVE_SETUP.md) instead. Install Rust/Cargo with your preferred toolchain manager, then:
+This is the standalone source path on Ubuntu 24.04 or 26.04. RawPair source users should follow its [integrated guide](https://github.com/rawpair/rawpair/blob/main/docs/NATIVE_SETUP.md) instead. Install Rust/Cargo with your preferred toolchain manager, then:
 
 ```sh
 sudo apt update
@@ -116,22 +118,22 @@ The source installer initializes the chosen subnet; select a different non-overl
 
 ## Releases
 
-Maintainers: set `Cargo.toml` and its lockfile package version together; tag `vMAJOR.MINOR.PATCH`. `.github/workflows/native-release.yml` builds natively on `ubuntu-24.04` and `ubuntu-24.04-arm` using Rust 1.99.0. Version mismatches and missing architecture assets fail the build. CI resolves dependencies, installs, initializes, retries provisioning, validates, reinstalls and removes the packages on disposable runners. Both architecture jobs must succeed before the workflow assembles a manifest/checksum list, creates GitHub build attestations and uploads a draft release. The operator reviews and publishes it. The workflow uses only repository-scoped `github.token` permissions, without a PAT or signing-key service.
+Maintainers: set `Cargo.toml` and its lockfile package version together; tag `vMAJOR.MINOR.PATCH`. `.github/workflows/native-release.yml` builds natively on `ubuntu-24.04` and `ubuntu-24.04-arm` using Rust 1.99.0. Version mismatches and missing architecture assets fail the build. CI resolves dependencies, installs, initializes, retries provisioning, validates, reinstalls and removes the packages on disposable runners. Both architecture builds and both Ubuntu 26.04 compatibility jobs must succeed before the workflow assembles a manifest/checksum list, creates GitHub build attestations and uploads a draft release. The operator reviews and publishes it. The workflow uses only repository-scoped `github.token` permissions, without a PAT or signing-key service.
 
 From a reviewed checkout containing the intended version, tag and push the release:
 
 ```sh
-ORQOS_TAG=v0.2.2  # use the version recorded in Cargo.toml and Cargo.lock
+ORQOS_TAG=v0.2.3  # use the version recorded in Cargo.toml and Cargo.lock
 git tag "$ORQOS_TAG"
 git push origin "$ORQOS_TAG"
 ```
 
-To retry, open **Actions → Native Ubuntu release (draft) → Run workflow** and enter the exact existing tag. The workflow checks out that tag. Wait for both architecture builds and the release job, review the draft's `.deb` packages, retained binaries, manifest, checksums and attestations, and inspect installation/lifecycle logs. Publish manually only after review; the workflow refuses to modify a published release. RawPair's compatibility manifest pins `v0.2.2`, so publish that partner before building RawPair's paired release. See [RawPair's release procedure](https://github.com/rawpair/rawpair/blob/main/docs/RELEASING.md).
+To retry, open **Actions → Native Ubuntu release (draft) → Run workflow** and enter the exact existing tag. The workflow checks out that tag. Wait for both architecture builds, both Ubuntu 26.04 compatibility jobs and the release job, review the draft's `.deb` packages, retained binaries, manifest, checksums and attestations, and inspect installation/lifecycle logs. Publish manually only after review; the workflow refuses to modify a published release. RawPair's compatibility manifest pins `v0.2.3`, so publish that partner before building RawPair's paired release. See [RawPair's release procedure](https://github.com/rawpair/rawpair/blob/main/docs/RELEASING.md).
 
 For local packaging after `cargo build --release --locked`:
 
 ```sh
-python3 packaging/build.py --tag v0.2.2 --arch amd64
+python3 packaging/build.py --tag v0.2.3 --arch amd64
 python3 -m unittest discover -s packaging -p 'test_*.py' -v
 ```
 
@@ -141,6 +143,6 @@ Checksums verify download integrity, not signatures. Optional provenance verific
 gh attestation verify orqos-host_VERSION_ARCH.deb --repo orqos-project/orqos
 ```
 
-RawPair's compatibility manifest requires the `v0.2.2` native-package release. Publish that reviewed Orqos release before building the paired RawPair release. Implementing the workflow does not publish release assets; a maintainer must complete the process above. Live systemd/network checks require a disposable privileged Linux host; source/unit tests alone do not establish a running installation.
+RawPair's compatibility manifest requires the `v0.2.3` native-package release. Publish that reviewed Orqos release before building the paired RawPair release. Implementing the workflow does not publish release assets; a maintainer must complete the process above. Live systemd/network checks require a disposable privileged Linux host; source/unit tests alone do not establish a running installation.
 
 Workspace homes start empty, with only the owned project and local-tool directories. Provisioning does not copy the host’s `/etc/skel`; install any desired shell configuration deliberately.
