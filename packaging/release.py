@@ -18,9 +18,9 @@ for arch in ('amd64', 'arm64'):
     target = 'x86_64' if arch == 'amd64' else 'aarch64'
     if not (a.output / f'orqos-{target}-unknown-linux-gnu').is_file():
         raise ValueError('Missing standalone binary: ' + target)
-artifacts = sorted([*a.output.glob('*.deb'), *a.output.glob('orqos-*')])
+artifacts = sorted([*a.output.glob('*.deb'), *a.output.glob('orqos-*-unknown-linux-gnu')])
 (a.output / 'manifest.json').write_text(json.dumps({'schema': 1, 'tag': a.tag, 'version': version,
                                                    'ubuntu': '24.04', 'architectures': ['amd64', 'arm64'],
                                                    'artifacts': [{'name': path.name, 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()} for path in artifacts]}, indent=2) + '\n')
-files = sorted([*a.output.glob('*.deb'), *a.output.glob('orqos-*'), a.output / 'manifest.json'])
+files = sorted([*artifacts, a.output / 'manifest.json'])
 (a.output / 'SHA256SUMS').write_text(''.join(hashlib.sha256(path.read_bytes()).hexdigest() + '  ' + path.name + '\n' for path in files))

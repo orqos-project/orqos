@@ -58,7 +58,7 @@ jobs:
           name: orqos-${{ matrix.arch }}
           path: |
             dist/*.deb
-            dist/orqos-*
+            dist/orqos-*-unknown-linux-gnu
   release:
     needs: build
     runs-on: ubuntu-24.04
@@ -84,7 +84,7 @@ jobs:
         with:
           subject-path: |
             dist/*.deb
-            dist/orqos-*
+            dist/orqos-*-unknown-linux-gnu
             dist/manifest.json
             dist/SHA256SUMS
       - name: Draft release for operator review
@@ -94,4 +94,4 @@ jobs:
           else
             gh release create "$RELEASE_TAG" --verify-tag --draft --title "$RELEASE_TAG" --notes 'Native Ubuntu 24.04 packages and standalone binaries. Review both architectures before publishing. See docs/PACKAGES.md.'
           fi
-          gh release upload "$RELEASE_TAG" dist/*.deb dist/orqos-* dist/manifest.json dist/SHA256SUMS --clobber
+          gh release upload "$RELEASE_TAG" dist/*.deb dist/orqos-*-unknown-linux-gnu dist/manifest.json dist/SHA256SUMS --clobber
