@@ -59,6 +59,7 @@ error), and **401** without the bearer token.
   "hostname": "shop-0",
   "restart": "always",
   "grace_seconds": 30,
+  "labels": {"example.org/app": "shop"},
   "containers": [
     {"name": "web", "image": "docker.io/library/nginx:1.27-alpine"},
     {"name": "worker", "image": "registry.example.com/shop/worker:1.4",
@@ -70,13 +71,14 @@ error), and **401** without the bearer token.
 | Field | Meaning |
 | --- | --- |
 | `hostname` | Hostname inside every container (DNS label). |
-| `containers[].name` | DNS label, unique in the pod. The container is named `orqos-<id>-<name>`. |
+| `containers[].name` | DNS label of at most 63 characters, unique in the pod. The container is named `orqos-<id>-<name>`. |
 | `containers[].image` | Image reference, pulled when missing. |
 | `containers[].command` | Replaces the image's entrypoint and default command (Kubernetes `command`). |
 | `containers[].args` | Replaces the image's default command (Kubernetes `args`). Without `command`, empty and lone `;` arguments are rejected: set `command` to pass them. |
 | `containers[].env` | Variables passed literally (no `$` or `%` expansion). |
 | `restart` | `always` (default), `on_failure` or `never`, for every container. Restarts back off from 1 s, doubling up to 5 minutes. |
 | `grace_seconds` | SIGTERM-to-SIGKILL time on stop (default 30, at most 3600). |
+| `labels` | Up to 32 labels set on the Podman pod and every container, for the client's own bookkeeping (Rezn records its ownership here). Keys: lowercase letters, digits, `.`, `/` and `-`, at most 128; the `dev.orqos.` prefix is reserved. Values: letters, digits and `. _ : / @ + -`, at most 256. They are part of the spec: changing them replaces the pod. Orqos's own ownership checks never rely on them. |
 
 Control characters are rejected everywhere. Unknown fields are rejected.
 

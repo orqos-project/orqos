@@ -52,6 +52,14 @@ fn systemd_word(value: &str) -> String {
     )
 }
 
+/// `Label=` lines for the client's labels (validated to need no quoting), after Orqos's own.
+fn client_labels(spec: &PodSpec) -> String {
+    spec.labels
+        .iter()
+        .map(|(k, v)| format!("Label={k}={v}\n"))
+        .collect()
+}
+
 fn header(token: &str) -> String {
     format!(
         "# Managed by Orqos for owner {token}. Do not edit: the next apply replaces this file.\n"
@@ -87,12 +95,13 @@ fn render_pod(id: &str, token: &str, spec: &PodSpec) -> String {
     format!(
         "{header}[Unit]\nDescription={description}\nStartLimitIntervalSec=0\n\n\
          [Pod]\nPodName={pod}\nHostName={hostname}\nUserNS=auto\n\
-         Label={OWNER_LABEL}={token}\nLabel={POD_LABEL}={id}\nExitPolicy=continue\nStopTimeout={grace}\n\n\
+         Label={OWNER_LABEL}={token}\nLabel={POD_LABEL}={id}\n{labels}ExitPolicy=continue\nStopTimeout={grace}\n\n\
          [Service]\nTimeoutStopSec={stop}\n",
         header = header(token),
         description = description(id, token, None),
         pod = pod_name(id),
         hostname = spec.hostname,
+        labels = client_labels(spec),
         grace = spec.grace_seconds,
         stop = spec.grace_seconds + 30,
     )
@@ -127,7 +136,8 @@ fn render_container(
         container.push_str(&format!("EnvironmentFile={base}.env\n"));
     }
     container.push_str(&format!(
-        "Label={OWNER_LABEL}={token}\nLabel={POD_LABEL}={id}\nStopTimeout={}\n",
+        "Label={OWNER_LABEL}={token}\nLabel={POD_LABEL}={id}\n{}StopTimeout={}\n",
+        client_labels(spec),
         spec.grace_seconds
     ));
     let restart = match spec.restart {
@@ -203,6 +213,7 @@ mod tests {
             serde_json::json!({
                 "hostname": "q",
                 "restart": "on_failure",
+                "labels": {"dev.rezn.owner": "0f0f", "dev.rezn.resource": "queue", "app.example/tier": "batch"},
                 "containers": [
                     {"name": "entry", "image": "alpine:3.22", "command": ["/bin/sh", "-c"],
                      "args": ["echo \"$1\" 100%", "sh", "", ";", "back\\slash"]},

@@ -17,6 +17,10 @@ pub struct PodSpec {
     /// Seconds between SIGTERM and SIGKILL when a container stops.
     #[serde(default = "default_grace")]
     pub grace_seconds: u32,
+    /// Labels set on the Podman pod and its containers, for clients' own bookkeeping (for example Rezn's
+    /// ownership). Keys are lowercase `[a-z0-9./-]`; the `dev.orqos.` prefix is reserved.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
 }
 
 fn default_grace() -> u32 {
@@ -66,6 +70,26 @@ fn is_label(value: &str, max: usize) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
 }
 
+fn valid_label_key(key: &str) -> bool {
+    key.len() <= 128
+        && key
+            .as_bytes()
+            .first()
+            .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"./-".contains(&b))
+        && !key.starts_with("dev.orqos.")
+}
+
+/// Label values need no quoting in Quadlet `Label=` lines and no systemd escaping.
+fn valid_label_value(value: &str) -> bool {
+    value.len() <= 256
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._:/@+-".contains(&b))
+}
+
 fn has_control(value: &str) -> bool {
     value.chars().any(|c| c.is_control())
 }
@@ -101,11 +125,26 @@ impl PodSpec {
         if self.grace_seconds > 3600 {
             return Err("grace_seconds: at most 3600".into());
         }
+        if self.labels.len() > 32 {
+            return Err("labels: at most 32".into());
+        }
+        for (key, value) in &self.labels {
+            if !valid_label_key(key) {
+                return Err(format!(
+                    "labels: invalid key {key:?} (lowercase letters, digits, '.', '/' and '-', at most 128; \"dev.orqos.\" is reserved)"
+                ));
+            }
+            if !valid_label_value(value) {
+                return Err(format!(
+                    "labels.{key}: letters, digits and . _ : / @ + -, at most 256 characters"
+                ));
+            }
+        }
         let mut names = BTreeSet::new();
         for (i, c) in self.containers.iter().enumerate() {
             let at = format!("containers[{i}]");
-            if !is_label(&c.name, 48) {
-                return Err(format!("{at}.name: a DNS label of at most 48 characters"));
+            if !is_label(&c.name, 63) {
+                return Err(format!("{at}.name: a DNS label of at most 63 characters"));
             }
             if !names.insert(c.name.as_str()) {
                 return Err(format!("{at}.name: duplicate container name {:?}", c.name));
@@ -196,6 +235,26 @@ mod tests {
             .unwrap()
             .push(json!({"name": "web", "image": "alpine"}));
         assert!(spec(v).unwrap_err().contains("duplicate"));
+    }
+
+    #[test]
+    fn labels_are_checked() {
+        let mut v = minimal();
+        v["labels"] = json!({"dev.rezn.owner": "ab12", "dev.rezn.ordinal": "0", "empty": ""});
+        assert!(spec(v.clone()).is_ok());
+        v["labels"] = json!({"dev.orqos.owner": "x"});
+        assert!(spec(v.clone()).unwrap_err().contains("reserved"));
+        v["labels"] = json!({"Upper": "x"});
+        assert!(spec(v.clone()).unwrap_err().contains("invalid key"));
+        v["labels"] = json!({"k": "two words"});
+        assert!(spec(v.clone()).unwrap_err().starts_with("labels.k"));
+        v["labels"] = json!({"k": "100%"});
+        assert!(spec(v).unwrap_err().starts_with("labels.k"));
+        let mut v = minimal();
+        v["containers"][0]["name"] = json!("c".repeat(63));
+        assert!(spec(v.clone()).is_ok());
+        v["containers"][0]["name"] = json!("c".repeat(64));
+        assert!(spec(v).is_err());
     }
 
     #[test]
