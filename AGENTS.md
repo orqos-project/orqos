@@ -11,6 +11,7 @@ The user explicitly requires a delivered, integrated MVP and usable operator set
 Orqos is a single-binary Rust 2021 daemon exposing an Axum HTTP/WebSocket API for Docker/Podman containers and Kubernetes pods.
 
 - `src/main.rs` initializes backends, background tasks, and HTTP serving; `src/router.rs` mounts routes for available backends.
+- `src/workload/` is the rootful Podman Quadlet backend for Rezn (`docs/WORKLOAD_API.md`); regenerate its golden units with `UPDATE_GOLDEN=1 cargo test render` and review the diff.
 - `src/routes/docker/` and `src/routes/kube/` contain backend handlers; `src/routes/shared/` contains metrics and event/stat streams.
 - `app_state.rs`, `docker_state.rs`, and `kube_state.rs` hold shared and backend state. Metrics polling, storage, and event fanout live in dedicated `src/` modules.
 - CI builds release artifacts and runs push/PR checks. Regression tests live beside their Rust modules; live smoke checks are in `scripts/smoke.py`. Swagger UI is generated at `/swagger/`.

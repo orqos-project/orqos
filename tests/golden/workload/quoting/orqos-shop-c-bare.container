@@ -1,0 +1,21 @@
+# Managed by Orqos for owner 0123456789abcdef0123456789abcdef. Do not edit: the next apply replaces this file.
+[Unit]
+Description=Orqos workload pod shop container bare owner 0123456789abcdef0123456789abcdef
+StartLimitIntervalSec=0
+
+[Container]
+ContainerName=orqos-shop-bare
+Pod=orqos-shop.pod
+Image=alpine:3.22
+Exec="a b" "quote\"d" "$$X" "50%%"
+Label=dev.orqos.owner=0123456789abcdef0123456789abcdef
+Label=dev.orqos.pod=shop
+StopTimeout=30
+
+[Service]
+Restart=on-failure
+RestartSec=1s
+RestartSteps=8
+RestartMaxDelaySec=300s
+TimeoutStartSec=600
+TimeoutStopSec=60

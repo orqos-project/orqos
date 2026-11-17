@@ -1,0 +1,16 @@
+# Managed by Orqos for owner 0123456789abcdef0123456789abcdef. Do not edit: the next apply replaces this file.
+[Unit]
+Description=Orqos workload pod shop owner 0123456789abcdef0123456789abcdef
+StartLimitIntervalSec=0
+
+[Pod]
+PodName=orqos-shop
+HostName=shop-0
+UserNS=auto
+Label=dev.orqos.owner=0123456789abcdef0123456789abcdef
+Label=dev.orqos.pod=shop
+ExitPolicy=continue
+StopTimeout=40
+
+[Service]
+TimeoutStopSec=70

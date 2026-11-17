@@ -34,6 +34,14 @@ Orqos is a local execution service; authentication for people, collaboration, HT
 
 See [package setup and operations](docs/PACKAGES.md), the [concrete API](docs/HOST_API.md), and the [original design brief](docs/HOST_BACKEND.md). Native implementation is delivered; Ubuntu package lifecycle and full privileged/browser acceptance still need live evidence as recorded in the [RawPair package handoff](https://github.com/rawpair/rawpair/blob/main/docs/PACKAGE_HANDOFF.md). Existing [local container evidence](docs/ASSESSMENT.md) covers Docker/Kubernetes only.
 
+## Workload mode
+
+`ORQOS_BACKENDS=workload` runs pods of containers as owned systemd units with rootful Podman (Quadlet), for
+[Rezn](https://github.com/rezn-project/rezn): each pod gets its own user namespace, ownership-checked units,
+restart backoff and graceful stop, and keeps running while Orqos is down. It combines with the container backends
+(`workload,docker`). Requires systemd ≥ 254, Podman ≥ 5 and root; see the [workload API](docs/WORKLOAD_API.md).
+This is the first slice: init containers, volumes, networks, probes and reboot recovery are in progress.
+
 ## Local Development
 
 The commands in this section run container backends. Use Linux, a Rust toolchain, and an accessible Docker/Podman socket or Kubernetes configuration. For native mode, follow the [installed helper/service setup](docs/PACKAGES.md#build-native-mode-from-source) instead of an unconfigured `cargo run`.
@@ -45,7 +53,7 @@ cargo run --locked
 
 The first build downloads Swagger UI and needs network access. The default HTTP address is `127.0.0.1:3000`; override it with `BIND_ADDR`.
 
-Select backends with `ORQOS_BACKENDS=docker|kube|both` (default: `both`). For Docker Desktop:
+Select backends with `ORQOS_BACKENDS=docker|kube|both` (default: `both`), optionally combined with `workload` (for example `workload,docker`). For Docker Desktop:
 
 ```bash
 ORQOS_BACKENDS=both \

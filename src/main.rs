@@ -1,4 +1,5 @@
 pub mod app_state;
+pub mod auth;
 pub mod backends;
 pub mod docker_state;
 pub mod host;
@@ -10,6 +11,7 @@ pub mod routes;
 pub mod spawn_docker_events_fanout;
 pub mod spawn_kube_events_fanout;
 pub mod stats;
+pub mod workload;
 
 use std::collections::HashMap;
 use std::env;
@@ -44,6 +46,11 @@ async fn main() -> Result<()> {
             .map_err(anyhow::Error::msg)?;
     let host = if backends.host {
         Some(Arc::new(crate::host::HostState::from_env().await?))
+    } else {
+        None
+    };
+    let workload = if backends.workload {
+        Some(Arc::new(crate::workload::WorkloadState::from_env().await?))
     } else {
         None
     };
@@ -89,7 +96,7 @@ async fn main() -> Result<()> {
         }
     }
     if let (Err(docker_error), Err(kube_error)) = (docker_probe, kube_probe) {
-        if !backends.host {
+        if !backends.host && !backends.workload {
             anyhow::bail!(
                 "No enabled backend is reachable: Docker: {}; Kubernetes: {}",
                 docker_error,
@@ -128,6 +135,7 @@ async fn main() -> Result<()> {
 
     let app_state = Arc::new(AppState {
         host,
+        workload,
         backends,
         docker_error,
         kube_error,
@@ -160,13 +168,26 @@ async fn main() -> Result<()> {
         })
     });
 
+    // Workload pods keep running when this daemon stops; report pods whose units failed or vanished.
+    let workload_reconciler = app_state.workload.clone().map(|workload| {
+        tokio::spawn(async move {
+            loop {
+                let problems = workload.reconcile().await;
+                if !problems.is_empty() {
+                    warn!(?problems, "Workload pods need attention");
+                }
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            }
+        })
+    });
+
     // Serve HTTP
     let bind_addr = env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".into());
-    if backends.host {
+    if backends.host || backends.workload {
         let address: std::net::SocketAddr = bind_addr.parse()?;
         anyhow::ensure!(
             address.ip().is_loopback(),
-            "Host control API must bind a loopback address"
+            "Host and workload control APIs must bind a loopback address"
         );
     }
     let listener = TcpListener::bind(&bind_addr).await?;
@@ -222,6 +243,9 @@ async fn main() -> Result<()> {
     }
 
     if let Some(handle) = host_reconciler {
+        handle.abort();
+    }
+    if let Some(handle) = workload_reconciler {
         handle.abort();
     }
     metric_handle.abort();
