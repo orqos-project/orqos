@@ -1,5 +1,7 @@
 RawPair native host MVP
 
+Status: delivered on 2026-10-11 together with RawPair. See ../rawpair/docs/HANDOFF.md and ../rawpair/docs/PACKAGE_HANDOFF.md for implemented behavior, checks, unverified live paths and limitations, and docs/HOST_API.md for the implemented contract.
+
 The canonical goal is ../rawpair/goal.txt. Read it together with ../rawpair/docs/HANDOFF.md and docs/HOST_BACKEND.md before implementing.
 
 Work in RawPair and Orqos. Orqos owns the native Linux execution backend: systemd supervision, workspace identities, resource limits, network namespaces, safe files, protected terminal/application forwarding, and runtime status. Preserve its existing Docker/Kubernetes contracts.
