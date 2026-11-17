@@ -3,38 +3,38 @@ use std::time::Duration;
 use bollard::{Docker, API_DEFAULT_VERSION};
 use kube::{Client, Config};
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BackendSelection {
     pub host: bool,
     pub docker: bool,
     pub kube: bool,
+    pub workload: bool,
 }
 
 impl BackendSelection {
+    /// `host`, `docker`, `kube` and `both` keep their meaning. A comma-separated set may combine `workload` with
+    /// `docker`, `kube` or `both`; `host` cannot be combined.
     pub fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "docker" => Ok(Self {
-                host: false,
-                docker: true,
-                kube: false,
-            }),
-            "kube" => Ok(Self {
-                host: false,
-                docker: false,
-                kube: true,
-            }),
-            "both" => Ok(Self {
-                host: false,
-                docker: true,
-                kube: true,
-            }),
-            "host" => Ok(Self {
-                host: true,
-                docker: false,
-                kube: false,
-            }),
-            _ => Err("ORQOS_BACKENDS must be host, docker, kube, or both".into()),
+        const USAGE: &str = "ORQOS_BACKENDS must be host, or a comma-separated set of docker, kube, both and workload";
+        let mut selection = Self::default();
+        let parts: Vec<&str> = value.split(',').map(str::trim).collect();
+        for part in &parts {
+            match *part {
+                "docker" => selection.docker = true,
+                "kube" => selection.kube = true,
+                "both" => {
+                    selection.docker = true;
+                    selection.kube = true;
+                }
+                "workload" => selection.workload = true,
+                "host" if parts.len() == 1 => selection.host = true,
+                "host" => {
+                    return Err("ORQOS_BACKENDS=host cannot be combined with other backends".into())
+                }
+                _ => return Err(USAGE.into()),
+            }
         }
+        Ok(selection)
     }
 }
 
@@ -103,6 +103,22 @@ mod tests {
         let both = BackendSelection::parse("both").unwrap();
         assert!(both.docker && both.kube);
         assert!(BackendSelection::parse("unknown").is_err());
+        for old in ["host", "docker", "kube", "both"] {
+            assert!(!BackendSelection::parse(old).unwrap().workload, "{old}");
+        }
+    }
+
+    #[test]
+    fn workload_combines_with_container_backends_but_not_host() {
+        let workload = BackendSelection::parse("workload").unwrap();
+        assert!(workload.workload && !workload.docker && !workload.kube && !workload.host);
+        let mixed = BackendSelection::parse("workload, docker").unwrap();
+        assert!(mixed.workload && mixed.docker && !mixed.kube);
+        let all = BackendSelection::parse("both,workload").unwrap();
+        assert!(all.workload && all.docker && all.kube);
+        assert!(BackendSelection::parse("host,workload").is_err());
+        assert!(BackendSelection::parse("workload,").is_err());
+        assert!(BackendSelection::parse("").is_err());
     }
 
     #[test]

@@ -8,9 +8,10 @@ The imported `AGENTS.md` is the maintained repository guide (structure, commands
 
 ## Backends
 
-Orqos is a single-binary Rust daemon (Axum HTTP/WebSocket API, OpenAPI via utoipa, Swagger UI at `/swagger`). `ORQOS_BACKENDS` selects `host`, `docker`, `kube` or `both` (default `both`, meaning Docker and Kubernetes). `src/backends.rs` parses the choice; `src/router.rs` mounts routes only for selected backends.
+Orqos is a single-binary Rust daemon (Axum HTTP/WebSocket API, OpenAPI via utoipa, Swagger UI at `/swagger`). `ORQOS_BACKENDS` selects `host`, or a comma-separated set of `docker`, `kube`, `both` and `workload` (default `both`, meaning Docker and Kubernetes). `src/backends.rs` parses the choice; `src/router.rs` mounts routes only for selected backends.
 
 - **Native host** (`ORQOS_BACKENDS=host`, Linux only): `src/host.rs` serves the bearer-authenticated `/host` API (`ORQOS_HOST_TOKEN`, at least 32 bytes; loopback bind only) and terminal/application forwarding. Privileged workspace, networking and safe-file operations live in the Python helpers under `host/`. Install, provisioning and release assets are in `packaging/`. Host mode starts without probing Docker or Kubernetes and does not mount their routes.
+- **Workload** (`ORQOS_BACKENDS=workload`, Linux, root): `src/workload/` runs pods as owned rootful Podman Quadlet units — spec validation (`spec.rs`), pure unit rendering with golden files in `tests/golden/workload/` (`render.rs`), records (`store.rs`), systemd/Podman calls and ownership checks (`units.rs`), host checks (`capabilities.rs`), and the `/workload` routes (bearer `ORQOS_WORKLOAD_TOKEN`; loopback bind only). See `docs/WORKLOAD_API.md`; live check `sudo python3 scripts/workload_smoke.py --orqos target/debug/orqos`.
 - **Docker/Podman** (`src/routes/docker/`): containers via bollard. Rezn consumes this API; preserve its routes and semantics.
 - **Kubernetes** (`src/routes/kube/`): pods via kube-rs.
 - **Shared** (`src/routes/shared/`): `/healthz`, `/metrics`, `/events/ws`, `/stats/ws`, plus exec/file helpers reused by both container backends.

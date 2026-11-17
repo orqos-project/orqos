@@ -40,6 +40,8 @@ pub struct HealthResponse {
     pub kube: BackendHealth,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host: Option<BackendHealth>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workload: Option<BackendHealth>,
 }
 
 impl HealthResponse {
@@ -50,6 +52,7 @@ impl HealthResponse {
             docker,
             kube,
             host: None,
+            workload: None,
         }
     }
     fn status_code(&self) -> StatusCode {
@@ -105,6 +108,19 @@ pub async fn health_handler(State(app): State<Arc<AppState>>) -> impl IntoRespon
             response.status = "degraded";
         }
         response.host = Some(health);
+    }
+    if let Some(workload) = &app.workload {
+        let problems = workload.capabilities().await.problems;
+        let result = if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(problems.join("; "))
+        };
+        let health = BackendHealth::new(true, result);
+        if !health.available {
+            response.status = "degraded";
+        }
+        response.workload = Some(health);
     }
     (response.status_code(), Json(response))
 }

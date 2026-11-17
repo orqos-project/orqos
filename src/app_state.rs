@@ -9,6 +9,7 @@ use crate::metric_registry::MetricRegistry;
 
 pub struct AppState {
     pub host: Option<Arc<crate::host::HostState>>,
+    pub workload: Option<Arc<crate::workload::WorkloadState>>,
     pub backends: BackendSelection,
     pub docker_error: Option<String>,
     pub kube_error: Option<String>,

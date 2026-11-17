@@ -26,8 +26,15 @@ use crate::routes::shared::stats_ws::stats_ws;
 #[derive(OpenApi)]
 #[openapi(
     info(description = "Orqos API"),
-    modifiers(&HostSecurity),
+    modifiers(&ControlSecurity),
     paths(
+        crate::workload::routes::capabilities,
+        crate::workload::routes::list,
+        crate::workload::routes::inspect,
+        crate::workload::routes::apply,
+        crate::workload::routes::start,
+        crate::workload::routes::stop,
+        crate::workload::routes::remove,
         crate::host::inventory,
         crate::host::list,
         crate::host::inspect,
@@ -55,18 +62,20 @@ use crate::routes::shared::stats_ws::stats_ws;
 )]
 struct ApiDoc;
 
-struct HostSecurity;
-impl utoipa::Modify for HostSecurity {
+struct ControlSecurity;
+impl utoipa::Modify for ControlSecurity {
     fn modify(&self, doc: &mut utoipa::openapi::OpenApi) {
         if let Some(components) = doc.components.as_mut() {
-            components.add_security_scheme(
-                "host_bearer",
-                utoipa::openapi::security::SecurityScheme::Http(
-                    utoipa::openapi::security::Http::new(
-                        utoipa::openapi::security::HttpAuthScheme::Bearer,
+            for scheme in ["host_bearer", "workload_bearer"] {
+                components.add_security_scheme(
+                    scheme,
+                    utoipa::openapi::security::SecurityScheme::Http(
+                        utoipa::openapi::security::Http::new(
+                            utoipa::openapi::security::HttpAuthScheme::Bearer,
+                        ),
                     ),
-                ),
-            );
+                );
+            }
         }
     }
 }
@@ -80,6 +89,10 @@ pub(crate) fn build_router(app: Arc<AppState>) -> Router {
 
     if app.backends.host {
         router = router.merge(crate::host::routes(app.clone()));
+    }
+
+    if app.backends.workload {
+        router = router.merge(crate::workload::routes::routes(app.clone()));
     }
 
     if app.backends.docker {
@@ -121,4 +134,72 @@ pub(crate) fn build_router(app: Arc<AppState>) -> Router {
     router.with_state(app).merge(
         utoipa_swagger_ui::SwaggerUi::new("/swagger").url("/api/openapi.json", ApiDoc::openapi()),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backends::BackendSelection;
+    use crate::metric_registry::MetricRegistry;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    fn app(selection: &str) -> Arc<AppState> {
+        Arc::new(AppState {
+            host: None,
+            workload: None,
+            backends: BackendSelection::parse(selection).unwrap(),
+            docker_error: Some("unavailable in tests".into()),
+            kube_error: Some("unavailable in tests".into()),
+            docker: None,
+            kube: None,
+            events_tx: tokio::sync::broadcast::channel(1).0,
+            stats_tx: tokio::sync::broadcast::channel(1).0,
+            metric_registry: MetricRegistry::default(),
+        })
+    }
+
+    async fn mounted(selection: &str, path: &str) -> bool {
+        let response = build_router(app(selection))
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        response.status() != StatusCode::NOT_FOUND
+    }
+
+    /// orqos#29: every previous ORQOS_BACKENDS value mounts exactly the routes it did before, and workload
+    /// routes appear only when selected.
+    #[tokio::test]
+    async fn routes_are_mounted_exactly_for_the_selected_backends() {
+        let cases = [
+            ("docker", [true, false, false, false]),
+            ("kube", [false, true, false, false]),
+            ("both", [true, true, false, false]),
+            ("host", [false, false, true, false]),
+            ("workload", [false, false, false, true]),
+            ("workload,docker", [true, false, false, true]),
+            ("both,workload", [true, true, false, true]),
+        ];
+        let paths = [
+            "/docker/containers",
+            "/kube/pods",
+            "/host/inventory",
+            "/workload/pods",
+        ];
+        for (selection, expected) in cases {
+            for (path, want) in paths.iter().zip(expected) {
+                assert_eq!(mounted(selection, path).await, want, "{selection} {path}");
+            }
+            assert!(mounted(selection, "/healthz").await, "{selection} /healthz");
+        }
+    }
+
+    #[test]
+    fn openapi_documents_workload_routes_with_their_own_bearer_scheme() {
+        let doc = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        assert!(doc["paths"]["/workload/pods/{id}"]["put"].is_object());
+        assert!(doc["components"]["securitySchemes"]["workload_bearer"].is_object());
+        assert!(doc["components"]["securitySchemes"]["host_bearer"].is_object());
+    }
 }

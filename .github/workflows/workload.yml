@@ -1,0 +1,56 @@
+name: Workload backend
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTUP_TOOLCHAIN: "1.99.0"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install pinned Rust toolchain
+      run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+    - name: Build
+      run: cargo build --locked
+    - uses: actions/upload-artifact@v4
+      with:
+        name: orqos-debug
+        path: target/debug/orqos
+        retention-days: 1
+
+  smoke:
+    # Podman 5 with Quadlet .pod units ships with Ubuntu 26.04.
+    needs: build
+    runs-on: ubuntu-26.04
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/download-artifact@v4
+      with:
+        name: orqos-debug
+        path: bin
+    - name: Install Podman
+      run: sudo apt-get update && sudo apt-get install -y podman
+    - name: Give the containers user subordinate IDs for UserNS=auto
+      run: |
+        for file in /etc/subuid /etc/subgid; do
+          grep -q '^containers:' "$file" || echo 'containers:2147483647:2147483648' | sudo tee -a "$file"
+        done
+    - name: Workload smoke
+      run: |
+        chmod +x bin/orqos
+        sudo python3 scripts/workload_smoke.py --orqos bin/orqos
+    - name: Diagnostics
+      if: failure()
+      run: |
+        sudo systemctl list-units 'orqos-*' --all --no-pager || true
+        sudo journalctl -u 'orqos-*' --no-pager -n 200 || true
+        sudo podman ps -a || true
+        sudo ls -R /etc/containers/systemd || true

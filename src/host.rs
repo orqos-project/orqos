@@ -34,13 +34,7 @@ pub struct HostState {
 
 impl HostState {
     pub async fn from_env() -> anyhow::Result<Self> {
-        let token = std::env::var("ORQOS_HOST_TOKEN").map_err(|_| {
-            anyhow::anyhow!("Set ORQOS_HOST_TOKEN to a random secret of at least 32 bytes")
-        })?;
-        anyhow::ensure!(
-            token.len() >= 32,
-            "ORQOS_HOST_TOKEN must contain at least 32 bytes"
-        );
+        let token = crate::auth::token_from_env("ORQOS_HOST_TOKEN")?;
         let state = Self {
             token,
             helper: PathBuf::from("/usr/lib/orqos/host.py"),
@@ -95,23 +89,7 @@ impl HostState {
     }
 
     fn authorized(&self, request: &Request) -> bool {
-        let Some(value) = request
-            .headers()
-            .get(header::AUTHORIZATION)
-            .and_then(|x| x.to_str().ok())
-        else {
-            return false;
-        };
-        let Some(candidate) = value.strip_prefix("Bearer ") else {
-            return false;
-        };
-        // All secrets have a fixed public length. Compare every byte.
-        candidate.len() == self.token.len()
-            && candidate
-                .bytes()
-                .zip(self.token.bytes())
-                .fold(0u8, |difference, (a, b)| difference | (a ^ b))
-                == 0
+        crate::auth::bearer_matches(request.headers(), &self.token)
     }
 }
 
