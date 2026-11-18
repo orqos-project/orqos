@@ -174,6 +174,69 @@ def run(orqos):
        "pods Orqos does not own are untouched")
 
 
+def net_spec(hostname, network, aliases):
+    return {"hostname": hostname, "grace_seconds": 5, "network": {"name": network, "aliases": aliases},
+            "containers": [{"name": "server", "image": IMAGE,
+                            "command": ["/bin/sh", "-c", "while true; do hostname | nc -l -p 8080; done"]}]}
+
+
+def resolve(container, name):
+    """IPv4 addresses `name` resolves to inside the container, or None when it does not resolve."""
+    result = subprocess.run(["podman", "exec", container, "getent", "ahostsv4", name], capture_output=True, text=True)
+    return None if result.returncode else {line.split()[0] for line in result.stdout.splitlines()}
+
+
+def networks(orqos):
+    """Pods on an owned network resolve each other's aliases; other networks cannot; the network goes with its
+    last pod."""
+    sh("podman", "network", "create", "--label", "owner=someone-else", "orqos-net-taken")
+    code, body = orqos.call("PUT", "/workload/pods/nettaken", net_spec("t-0", "taken", []))
+    ok(code == 409, f"an unowned Podman network with the same name is not adopted ({code} {body})")
+
+    pods = {
+        "web0": net_spec("web-0", "smoke", ["web", "web.ns", "web.ns.svc", "web-0.web"]),
+        "web1": net_spec("web-1", "smoke", ["web", "web.ns.svc", "web-1.web"]),
+        "other": net_spec("other-0", "smoke-other", ["web-elsewhere"]),
+    }
+    for pod, spec in pods.items():
+        code, body = orqos.call("PUT", f"/workload/pods/{pod}", spec)
+        ok(code == 200, f"apply creates {pod} on network {spec['network']['name']} ({code} {body if code != 200 else ''})")
+    for pod in pods:
+        wait_state(orqos, pod, "running")
+
+    labels = json.loads(sh("podman", "network", "inspect", "orqos-net-smoke", "--format", "json"))
+    labels = (labels[0] if isinstance(labels, list) else labels).get("labels", {})
+    ok("dev.orqos.owner" in labels and labels.get("dev.orqos.network") == "smoke",
+       f"the Podman network carries ownership labels ({labels})")
+
+    web0, web1 = resolve("orqos-web1-server", "web-0.web"), resolve("orqos-web1-server", "web-1.web")
+    ok(web0 and web1 and len(web0) == 1 and len(web1) == 1 and web0 != web1,
+       f"per-pod aliases resolve to one address each ({web0}, {web1})")
+    ok(resolve("orqos-web1-server", "web") == web0 | web1, "a shared alias resolves to every pod that has it")
+    ok(resolve("orqos-web0-server", "web.ns.svc") == web0 | web1, "dotted aliases resolve (web.ns.svc)")
+    ok(resolve("orqos-web1-server", "web.ns") == web0, "an alias resolves only to the pods that have it")
+    ok(sh("podman", "exec", "orqos-web1-server", "nc", "web-0.web", "8080") == "web-0",
+       "a pod reaches another by alias over the network")
+    ok(resolve("orqos-other-server", "web") is None and resolve("orqos-other-server", "web-0.web") is None,
+       "a pod on another network cannot resolve them")
+
+    code, listed = orqos.call("GET", "/workload/networks")
+    smoke = next((n for n in listed if n["name"] == "smoke"), None) if code == 200 else None
+    ok(smoke and smoke["exists"] and smoke["pods"] == ["web0", "web1"] and smoke["podman_name"] == "orqos-net-smoke",
+       f"the networks endpoint lists the network and its pods ({listed})")
+
+    exists = lambda name: subprocess.run(["podman", "network", "exists", name]).returncode == 0
+    orqos.call("DELETE", "/workload/pods/web0")
+    ok(exists("orqos-net-smoke"), "the network stays while a pod still names it")
+    orqos.call("DELETE", "/workload/pods/web1")
+    orqos.call("DELETE", "/workload/pods/other")
+    ok(not exists("orqos-net-smoke") and not exists("orqos-net-smoke-other"),
+       "removing a network's last pod removes the network")
+    code, listed = orqos.call("GET", "/workload/networks")
+    ok(code == 200 and listed == [], f"no owned networks remain ({listed})")
+    ok(exists("orqos-net-taken"), "networks Orqos does not own are untouched")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--orqos", required=True, help="path to the orqos binary")
@@ -186,16 +249,20 @@ def main():
     orqos.start()
     try:
         run(orqos)
+        networks(orqos)
         print("workload smoke: all checks passed")
     finally:
         try:
             if orqos.process.poll() is None:
-                orqos.call("DELETE", "/workload/pods/smoke")
+                for pod in ("smoke", "web0", "web1", "other", "nettaken"):
+                    orqos.call("DELETE", f"/workload/pods/{pod}")
         except Exception:  # cleanup must continue
             pass
         orqos.stop()
         for pod in (FOREIGN, "orqos-taken", "orqos-smoke"):
             subprocess.run(["podman", "pod", "rm", "--force", "--ignore", pod], capture_output=True)
+        for network in ("orqos-net-taken", "orqos-net-smoke", "orqos-net-smoke-other"):
+            subprocess.run(["podman", "network", "rm", "--force", network], capture_output=True)
 
 
 if __name__ == "__main__":

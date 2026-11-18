@@ -35,6 +35,7 @@ use crate::routes::shared::stats_ws::stats_ws;
         crate::workload::routes::start,
         crate::workload::routes::stop,
         crate::workload::routes::remove,
+        crate::workload::routes::networks,
         crate::host::inventory,
         crate::host::list,
         crate::host::inspect,
@@ -199,6 +200,7 @@ mod tests {
     fn openapi_documents_workload_routes_with_their_own_bearer_scheme() {
         let doc = serde_json::to_value(ApiDoc::openapi()).unwrap();
         assert!(doc["paths"]["/workload/pods/{id}"]["put"].is_object());
+        assert!(doc["paths"]["/workload/networks"]["get"].is_object());
         assert!(doc["components"]["securitySchemes"]["workload_bearer"].is_object());
         assert!(doc["components"]["securitySchemes"]["host_bearer"].is_object());
     }

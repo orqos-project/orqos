@@ -11,7 +11,10 @@ use axum::{
 };
 use serde_json::json;
 
-use super::{capabilities::Capabilities, spec::PodSpec, PodStatus, WorkloadError, WorkloadState};
+use super::{
+    capabilities::Capabilities, spec::PodSpec, NetworkStatus, PodStatus, WorkloadError,
+    WorkloadState,
+};
 use crate::app_state::AppState;
 
 fn state(app: &AppState) -> Result<&Arc<WorkloadState>, WorkloadError> {
@@ -46,6 +49,7 @@ pub fn routes(app: Arc<AppState>) -> Router<Arc<AppState>> {
         )
         .route("/workload/pods/{id}/start", post(start))
         .route("/workload/pods/{id}/stop", post(stop))
+        .route("/workload/networks", get(networks))
         .layer(DefaultBodyLimit::max(1024 * 1024))
         .route_layer(middleware::from_fn_with_state(app, authenticate))
 }
@@ -117,4 +121,13 @@ pub async fn remove(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, WorkloadError> {
     Ok(Json(state(&app)?.remove(&id).await?))
+}
+
+#[utoipa::path(get, path = "/workload/networks", security(("workload_bearer" = [])),
+    responses((status = 200, description = "Owned pod networks and the pods that name them", body = [NetworkStatus])),
+    tag = "Workload")]
+pub async fn networks(
+    State(app): State<Arc<AppState>>,
+) -> Result<Json<Vec<NetworkStatus>>, WorkloadError> {
+    Ok(Json(state(&app)?.networks().await?))
 }
