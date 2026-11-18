@@ -461,7 +461,7 @@ def probes(orqos):
     process behind."""
     spec = {"hostname": "pr-0", "grace_seconds": 2, "containers": [
         {"name": "app", "image": IMAGE, "command": ["/bin/sh", "-c", RESPONDER],
-         "startup": probe({"exec": ["test", "-f", "/tmp/started"]}),
+         "startup": probe({"exec": ["test", "-f", "/tmp/started"]}, threshold=120),
          "readiness": probe({"http": {"path": "/ready", "port": 8080, "scheme": "http"}}),
          "liveness": probe({"exec": ["/bin/sh", "-c", "test ! -f /tmp/dead"]}, threshold=2)},
         {"name": "tls", "image": IMAGE, "command": ["/bin/sh", "-c", TLS_SERVER],
