@@ -613,17 +613,16 @@ def resources(orqos):
     wide = sh("podman", "exec", "orqos-rs-wide", "cat", "/sys/fs/cgroup/cpu.max").split()
     ok(int(wide[0]) // int(wide[1]) == capacity["cpu_millis"] // 1000,
        f"a CPU limit above the host's CPUs is capped at them ({wide})")
-    before = int(sh("systemctl", "show", "-p", "NRestarts", "--value", "orqos-rs-c-app.service"))
-    subprocess.run(["podman", "exec", "orqos-rs-app", "sh", "-c", "head -c 200000000 /dev/zero | tail -c 1 >/dev/null"],
-                   capture_output=True)
-    until("the OOM kill", lambda: "oom-kill" in sh("podman", "exec", "orqos-rs-app", "cat",
-                                                     "/sys/fs/cgroup/memory.events", check=False)
-          or int(sh("systemctl", "show", "-p", "NRestarts", "--value", "orqos-rs-c-app.service")) > before,
-          seconds=60)
-    events = sh("podman", "exec", "orqos-rs-app", "cat", "/sys/fs/cgroup/memory.events", check=False)
-    oom = next((l for l in events.splitlines() if l.startswith("oom_kill ")), "oom_kill 0")
-    ok(int(oom.split()[1]) >= 1 or int(sh("systemctl", "show", "-p", "NRestarts", "--value", "orqos-rs-c-app.service")) > before,
-       f"a process past the memory limit is OOM-killed ({oom})")
+    def oom_kills():
+        events = sh("podman", "exec", "orqos-rs-app", "cat", "/sys/fs/cgroup/memory.events", check=False)
+        line = next((l for l in events.splitlines() if l.startswith("oom_kill ")), "oom_kill 0")
+        return int(line.split()[1])
+    # dd allocates its whole 100 MB block at once, past the 64 MiB limit.
+    hog = subprocess.run(["podman", "exec", "orqos-rs-app", "dd", "if=/dev/zero", "of=/dev/null", "bs=100M", "count=1"],
+                         capture_output=True, text=True)
+    until("the OOM kill", lambda: oom_kills() >= 1, seconds=30)
+    ok(hog.returncode != 0 and oom_kills() >= 1,
+       f"a process past the memory limit is OOM-killed (exit {hog.returncode}, oom_kill {oom_kills()})")
     orqos.call("DELETE", "/workload/pods/rs")
 
 
