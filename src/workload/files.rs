@@ -114,10 +114,22 @@ pub fn project(
             fs::remove_dir_all(leftover).map_err(io("remove", leftover))?;
         }
     }
-    if spec.secret_files().next().is_none() {
+    if spec.secret_files().next().is_none() && spec.image_pull_secrets.is_empty() {
         return remove(root, id);
     }
     ensure_private(&staged)?;
+    if !spec.image_pull_secrets.is_empty() {
+        let auth = staged.join(AUTH_FILE);
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&auth)
+            .map_err(io("create", &auth))?;
+        file.write_all(&pull_auth(spec, secrets)?)
+            .map_err(io("write", &auth))?;
+        file.sync_all().map_err(io("sync", &auth))?;
+    }
     for (volume, files) in spec.secret_files() {
         let data = secrets
             .get(&files.name)
@@ -134,10 +146,70 @@ pub fn project(
     Ok(())
 }
 
-/// Whether every secret volume of the pod has been written.
+/// Whether every secret volume (and the registry auth file) of the pod has been written.
 pub fn present(root: &Path, id: &str, spec: &PodSpec) -> bool {
     spec.secret_files()
         .all(|(volume, _)| pod_dir(root, id).join(volume).is_dir())
+        && (spec.image_pull_secrets.is_empty() || auth_path(root, id).is_file())
+}
+
+/// Writes a root-only (0600) file, replacing any earlier one, in the root-only files tree.
+pub fn write_private(root: &Path, path: &Path, content: &[u8]) -> Result<(), WorkloadError> {
+    ensure_private(root)?;
+    let _ = fs::remove_file(path);
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(io("create", path))?;
+    file.write_all(content).map_err(io("write", path))?;
+    file.sync_all().map_err(io("sync", path))
+}
+
+/// The registry credentials of a pod's image pulls, as Podman's `--authfile` (0600, root-only parents).
+pub const AUTH_FILE: &str = "registry-auth.json";
+
+pub fn auth_path(root: &Path, id: &str) -> PathBuf {
+    pod_dir(root, id).join(AUTH_FILE)
+}
+
+/// The key of Docker's registry credentials in a pull secret.
+pub const DOCKER_CONFIG: &str = ".dockerconfigjson";
+
+/// Merges `.dockerconfigjson` documents into one auth file: the first document wins for each registry, as in
+/// Kubernetes. Each must be a JSON object with an `auths` object.
+pub fn merge_auths(documents: &[(&str, &[u8])]) -> Result<Vec<u8>, String> {
+    let mut auths = serde_json::Map::new();
+    for (secret, document) in documents {
+        let parsed: serde_json::Value = serde_json::from_slice(document)
+            .map_err(|e| format!("secret {secret:?}: {DOCKER_CONFIG} is not JSON: {e}"))?;
+        let entries = parsed
+            .get("auths")
+            .and_then(|a| a.as_object())
+            .ok_or_else(|| format!("secret {secret:?}: {DOCKER_CONFIG} has no \"auths\" object"))?;
+        for (registry, entry) in entries {
+            auths
+                .entry(registry.clone())
+                .or_insert_with(|| entry.clone());
+        }
+    }
+    Ok(serde_json::to_vec(&serde_json::json!({ "auths": auths })).expect("JSON serializes"))
+}
+
+/// The merged credentials of a pod's pull secrets.
+pub fn pull_auth(spec: &PodSpec, secrets: &Secrets) -> Result<Vec<u8>, WorkloadError> {
+    let mut documents = Vec::new();
+    for name in &spec.image_pull_secrets {
+        let document = secrets
+            .get(name)
+            .and_then(|data| data.get(DOCKER_CONFIG))
+            .ok_or_else(|| {
+                WorkloadError::Invalid(format!("pull secret {name:?} has no {DOCKER_CONFIG} key"))
+            })?;
+        documents.push((name.as_str(), document.as_slice()));
+    }
+    merge_auths(&documents).map_err(WorkloadError::Invalid)
 }
 
 /// Removes the pod's secret files.
@@ -161,6 +233,24 @@ mod tests {
         assert_eq!(directory_mode(0o600), 0o500);
         assert_eq!(directory_mode(0o000), 0o000);
         assert_eq!(directory_mode(0o777), 0o555);
+    }
+
+    #[test]
+    fn pull_secrets_merge_with_the_first_winning() {
+        let a =
+            br#"{"auths": {"localhost:5000": {"auth": "YTpi"}, "quay.io": {"auth": "Zmlyc3Q="}}}"#;
+        let b = br#"{"auths": {"quay.io": {"auth": "c2Vjb25k"}, "ghcr.io": {"auth": "Z2g="}}}"#;
+        let merged: serde_json::Value =
+            serde_json::from_slice(&merge_auths(&[("a", a), ("b", b)]).unwrap()).unwrap();
+        assert_eq!(merged["auths"]["quay.io"]["auth"], "Zmlyc3Q=");
+        assert_eq!(merged["auths"]["ghcr.io"]["auth"], "Z2g=");
+        assert_eq!(merged["auths"].as_object().unwrap().len(), 3);
+        assert!(merge_auths(&[("x", b"not json")])
+            .unwrap_err()
+            .contains("not JSON"));
+        assert!(merge_auths(&[("x", br#"{"credsStore": "pass"}"#)])
+            .unwrap_err()
+            .contains("no \"auths\""));
     }
 
     #[test]

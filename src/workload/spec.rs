@@ -19,6 +19,10 @@ pub struct PodSpec {
     /// When a sidecar has a startup probe, `containers` start only once every such probe has passed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sidecars: Vec<ContainerSpec>,
+    /// Owned secrets holding `.dockerconfigjson` (Docker's registry credentials); their `auths` are merged, the
+    /// first secret winning per registry, and used for every pull of the pod's images.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub image_pull_secrets: Vec<String>,
     /// Restart policy of every container. Restarts back off from 1 s to 5 minutes.
     #[serde(default)]
     pub restart: Restart,
@@ -374,6 +378,28 @@ pub struct ContainerSpec {
     pub liveness: Option<Probe>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<Resources>,
+    /// When to pull the image: `missing` (the default), `always` (on every container start) or `never`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull: Option<Pull>,
+}
+
+/// Image pull policy (Quadlet `Pull=`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Pull {
+    Missing,
+    Always,
+    Never,
+}
+
+impl Pull {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Pull::Missing => "missing",
+            Pull::Always => "always",
+            Pull::Never => "never",
+        }
+    }
 }
 
 /// Cgroup limits and requests of one container (cgroup v2, through Podman). Limits are hard; requests set the
@@ -624,6 +650,7 @@ impl PodSpec {
                 self.every_container()
                     .flat_map(|(_, c)| c.secret_env.values().map(|r| r.secret.as_str())),
             )
+            .chain(self.image_pull_secrets.iter().map(String::as_str))
             .collect()
     }
 
@@ -702,6 +729,18 @@ impl PodSpec {
                     return Err(format!("network.aliases[{i}]: duplicate alias {alias:?}"));
                 }
             }
+        }
+        if self.image_pull_secrets.len() > 8 {
+            return Err("image_pull_secrets: at most 8".into());
+        }
+        if let Some(i) = self
+            .image_pull_secrets
+            .iter()
+            .position(|s| !valid_secret_name(s))
+        {
+            return Err(format!(
+                "image_pull_secrets[{i}]: a DNS label of at most 48 characters"
+            ));
         }
         if self.init.len() + self.sidecars.len() + self.containers.len() > 32 {
             return Err("at most 32 containers in all".into());
@@ -1141,6 +1180,31 @@ mod tests {
             !spec(plain).unwrap().gated(),
             "only a sidecar startup probe gates"
         );
+    }
+
+    #[test]
+    fn pull_policies_and_pull_secrets_are_checked() {
+        let mut v = minimal();
+        v["image_pull_secrets"] = json!(["rz-registry"]);
+        v["containers"][0]["pull"] = json!("always");
+        let ok = spec(v.clone()).unwrap();
+        assert_eq!(ok.containers[0].pull, Some(Pull::Always));
+        assert!(
+            ok.secrets().contains("rz-registry"),
+            "pull secrets are in use while the pod exists"
+        );
+        v["containers"][0]["pull"] = json!("if_not_present");
+        assert!(
+            spec(v.clone()).is_err(),
+            "Orqos's names are Podman's: missing, always, never"
+        );
+        v["containers"][0]["pull"] = json!("never");
+        v["image_pull_secrets"] = json!(["Bad"]);
+        assert!(spec(v.clone())
+            .unwrap_err()
+            .starts_with("image_pull_secrets[0]"));
+        v["image_pull_secrets"] = json!((0..9).map(|i| format!("s{i}")).collect::<Vec<_>>());
+        assert!(spec(v).unwrap_err().contains("at most 8"));
     }
 
     #[test]

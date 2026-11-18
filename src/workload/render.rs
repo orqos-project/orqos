@@ -266,6 +266,16 @@ fn render_container(
     if let Some(resources) = &c.resources {
         container.push_str(&resource_lines(resources, inputs.cpu_millis));
     }
+    if let Some(pull) = c.pull {
+        container.push_str(&format!("Pull={}\n", pull.as_str()));
+    }
+    if !spec.image_pull_secrets.is_empty() {
+        // Container units have no AuthFile= key; podman run takes the merged credentials directly.
+        container.push_str(&format!(
+            "PodmanArgs=--authfile={}\n",
+            files::auth_path(inputs.files, id).display()
+        ));
+    }
     for m in &c.mounts {
         let volume = spec
             .volumes
@@ -605,6 +615,21 @@ mod tests {
             "limits above the host's CPUs are capped; shares are at least 2"
         );
         assert_eq!(resource_lines(&Resources::default(), 2000), "");
+    }
+
+    #[test]
+    fn pulls_follow_their_policy_with_the_pods_credentials() {
+        golden(
+            "registry",
+            serde_json::json!({
+                "hostname": "api-0",
+                "image_pull_secrets": ["rz-registry"],
+                "containers": [
+                    {"name": "api", "image": "localhost:5000/rezn/private:1", "pull": "always"},
+                    {"name": "pinned", "image": "docker.io/library/alpine@sha256:4bcff63911fcb4448bd4fdacec207030997caf25e9bea4045fa6c8c44de311d1", "pull": "never"}
+                ]
+            }),
+        );
     }
 
     #[test]
