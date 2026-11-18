@@ -6,7 +6,7 @@ StartLimitIntervalSec=0
 [Pod]
 PodName=orqos-shop
 HostName=db-0
-UserNS=auto
+UserNS=auto:size=65536
 Network=orqos-net-rz-0123456789abcdef01234567
 NetworkAlias=db
 NetworkAlias=db.shop

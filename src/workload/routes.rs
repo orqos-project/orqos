@@ -12,8 +12,9 @@ use axum::{
 use serde_json::json;
 
 use super::{
-    capabilities::Capabilities, spec::PodSpec, NetworkStatus, PodStatus, WorkloadError,
-    WorkloadState,
+    capabilities::Capabilities,
+    spec::{PodSpec, VolumeSpec},
+    NetworkStatus, PodStatus, VolumeStatus, WorkloadError, WorkloadState,
 };
 use crate::app_state::AppState;
 
@@ -50,6 +51,11 @@ pub fn routes(app: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/workload/pods/{id}/start", post(start))
         .route("/workload/pods/{id}/stop", post(stop))
         .route("/workload/networks", get(networks))
+        .route("/workload/volumes", get(volumes))
+        .route(
+            "/workload/volumes/{name}",
+            axum::routing::put(apply_volume).delete(remove_volume),
+        )
         .layer(DefaultBodyLimit::max(1024 * 1024))
         .route_layer(middleware::from_fn_with_state(app, authenticate))
 }
@@ -130,4 +136,43 @@ pub async fn networks(
     State(app): State<Arc<AppState>>,
 ) -> Result<Json<Vec<NetworkStatus>>, WorkloadError> {
     Ok(Json(state(&app)?.networks().await?))
+}
+
+#[utoipa::path(get, path = "/workload/volumes", security(("workload_bearer" = [])),
+    responses((status = 200, description = "Owned volumes and the pods that mount them", body = [VolumeStatus])),
+    tag = "Workload")]
+pub async fn volumes(
+    State(app): State<Arc<AppState>>,
+) -> Result<Json<Vec<VolumeStatus>>, WorkloadError> {
+    Ok(Json(state(&app)?.volumes().await?))
+}
+
+#[utoipa::path(put, path = "/workload/volumes/{name}", security(("workload_bearer" = [])),
+    params(("name" = String, Path, description = "Volume name: a DNS label of at most 48 characters")),
+    request_body = VolumeSpec,
+    responses(
+        (status = 200, description = "Created, or its spec updated", body = VolumeStatus),
+        (status = 409, description = "A Podman volume of that name is not owned by Orqos, or the recorded volume vanished"),
+        (status = 422, description = "Invalid name or spec")),
+    tag = "Workload")]
+pub async fn apply_volume(
+    State(app): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(spec): Json<VolumeSpec>,
+) -> Result<Json<VolumeStatus>, WorkloadError> {
+    Ok(Json(state(&app)?.apply_volume(&name, spec).await?))
+}
+
+#[utoipa::path(delete, path = "/workload/volumes/{name}", security(("workload_bearer" = [])),
+    params(("name" = String, Path, description = "Volume name")),
+    responses(
+        (status = 200, description = "The volume and its data are deleted"),
+        (status = 404, description = "Unknown volume"),
+        (status = 409, description = "Mounted by a pod, or not owned by Orqos")),
+    tag = "Workload")]
+pub async fn remove_volume(
+    State(app): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, WorkloadError> {
+    Ok(Json(state(&app)?.remove_volume(&name).await?))
 }

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use super::spec::{valid_id, valid_network_name, PodSpec};
+use super::spec::{valid_id, valid_network_name, valid_volume_name, PodSpec, VolumeSpec};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -39,6 +39,31 @@ pub struct NetworkRecord {
     pub name: String,
     pub token: String,
     pub created_at: String,
+}
+
+/// An owned Podman volume (`orqos-vol-<name>`), labelled with its own token. The spec (group and the client's
+/// labels) lives here and may change; Podman volume labels cannot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VolumeRecord {
+    pub name: String,
+    pub token: String,
+    pub spec: VolumeSpec,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl Keyed for VolumeRecord {
+    const WHAT: &'static str = "volume name";
+    fn valid_key(key: &str) -> bool {
+        valid_volume_name(key)
+    }
+    fn key(&self) -> &str {
+        &self.name
+    }
+    fn token(&self) -> &str {
+        &self.token
+    }
 }
 
 /// A record stored as `<key>.json`.
