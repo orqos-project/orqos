@@ -39,6 +39,9 @@ use crate::routes::shared::stats_ws::stats_ws;
         crate::workload::routes::volumes,
         crate::workload::routes::apply_volume,
         crate::workload::routes::remove_volume,
+        crate::workload::routes::secrets,
+        crate::workload::routes::apply_secret,
+        crate::workload::routes::remove_secret,
         crate::host::inventory,
         crate::host::list,
         crate::host::inspect,
@@ -205,6 +208,7 @@ mod tests {
         assert!(doc["paths"]["/workload/pods/{id}"]["put"].is_object());
         assert!(doc["paths"]["/workload/networks"]["get"].is_object());
         assert!(doc["paths"]["/workload/volumes/{name}"]["put"].is_object());
+        assert!(doc["paths"]["/workload/secrets/{name}"]["put"].is_object());
         assert!(doc["components"]["securitySchemes"]["workload_bearer"].is_object());
         assert!(doc["components"]["securitySchemes"]["host_bearer"].is_object());
     }

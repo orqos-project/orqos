@@ -13,8 +13,8 @@ use serde_json::json;
 
 use super::{
     capabilities::Capabilities,
-    spec::{PodSpec, VolumeSpec},
-    NetworkStatus, PodStatus, VolumeStatus, WorkloadError, WorkloadState,
+    spec::{PodSpec, SecretSpec, VolumeSpec},
+    NetworkStatus, PodStatus, SecretStatus, VolumeStatus, WorkloadError, WorkloadState,
 };
 use crate::app_state::AppState;
 
@@ -56,7 +56,13 @@ pub fn routes(app: Arc<AppState>) -> Router<Arc<AppState>> {
             "/workload/volumes/{name}",
             axum::routing::put(apply_volume).delete(remove_volume),
         )
-        .layer(DefaultBodyLimit::max(1024 * 1024))
+        .route("/workload/secrets", get(secrets))
+        .route(
+            "/workload/secrets/{name}",
+            axum::routing::put(apply_secret).delete(remove_secret),
+        )
+        // A secret's 1 MiB of data is about 1.4 MiB in base64.
+        .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
         .route_layer(middleware::from_fn_with_state(app, authenticate))
 }
 
@@ -175,4 +181,43 @@ pub async fn remove_volume(
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, WorkloadError> {
     Ok(Json(state(&app)?.remove_volume(&name).await?))
+}
+
+#[utoipa::path(get, path = "/workload/secrets", security(("workload_bearer" = [])),
+    responses((status = 200, description = "Owned secrets: keys, labels and the pods using them; never values", body = [SecretStatus])),
+    tag = "Workload")]
+pub async fn secrets(
+    State(app): State<Arc<AppState>>,
+) -> Result<Json<Vec<SecretStatus>>, WorkloadError> {
+    Ok(Json(state(&app)?.secrets().await?))
+}
+
+#[utoipa::path(put, path = "/workload/secrets/{name}", security(("workload_bearer" = [])),
+    params(("name" = String, Path, description = "Secret name: a DNS label of at most 48 characters")),
+    request_body = SecretSpec,
+    responses(
+        (status = 200, description = "Created, or its labels updated", body = SecretStatus),
+        (status = 409, description = "The secret exists with different data (secrets are immutable)"),
+        (status = 422, description = "Invalid name or spec")),
+    tag = "Workload")]
+pub async fn apply_secret(
+    State(app): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(spec): Json<SecretSpec>,
+) -> Result<Json<SecretStatus>, WorkloadError> {
+    Ok(Json(state(&app)?.apply_secret(&name, spec).await?))
+}
+
+#[utoipa::path(delete, path = "/workload/secrets/{name}", security(("workload_bearer" = [])),
+    params(("name" = String, Path, description = "Secret name")),
+    responses(
+        (status = 200, description = "The secret is deleted"),
+        (status = 404, description = "Unknown secret"),
+        (status = 409, description = "Used by a pod")),
+    tag = "Workload")]
+pub async fn remove_secret(
+    State(app): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, WorkloadError> {
+    Ok(Json(state(&app)?.remove_secret(&name).await?))
 }

@@ -1,6 +1,6 @@
 //! Pod records under `/var/lib/orqos/workload/<id>.json` (the accepted spec, its ownership token and the desired
-//! state) and network records under `/var/lib/orqos/workload/networks/<name>.json`. Writes are atomic (temporary
-//! file, fsync, rename, directory fsync).
+//! state), and network, volume and secret records under `networks/`, `volumes/` and `secrets/` beside them. Writes
+//! are atomic (temporary file, fsync, rename, directory fsync).
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -9,7 +9,10 @@ use std::path::{Path, PathBuf};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use super::spec::{valid_id, valid_network_name, valid_volume_name, PodSpec, VolumeSpec};
+use super::spec::{
+    valid_id, valid_network_name, valid_secret_name, valid_volume_name, PodSpec, SecretSpec,
+    VolumeSpec,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -57,6 +60,31 @@ impl Keyed for VolumeRecord {
     const WHAT: &'static str = "volume name";
     fn valid_key(key: &str) -> bool {
         valid_volume_name(key)
+    }
+    fn key(&self) -> &str {
+        &self.name
+    }
+    fn token(&self) -> &str {
+        &self.token
+    }
+}
+
+/// An owned secret under `/var/lib/orqos/workload/secrets/<name>.json` (0600 in a 0700 directory). Its data never
+/// changes; its labels may. There is no Podman object: Orqos writes the files and environment itself.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretRecord {
+    pub name: String,
+    pub token: String,
+    pub spec: SecretSpec,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl Keyed for SecretRecord {
+    const WHAT: &'static str = "secret name";
+    fn valid_key(key: &str) -> bool {
+        valid_secret_name(key)
     }
     fn key(&self) -> &str {
         &self.name

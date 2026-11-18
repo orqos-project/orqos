@@ -8,6 +8,7 @@ removed at the end, including after a failure.
     sudo python3 scripts/workload_smoke.py --orqos target/debug/orqos
 """
 import argparse
+import base64
 import json
 import os
 import re
@@ -344,6 +345,88 @@ def storage(orqos):
     ok(exists("orqos-vol-taken"), "volumes Orqos does not own are untouched")
 
 
+FILES = "/var/lib/orqos/workload/files"
+PASSWORD = "p a$$ \"w%rd\" #1  "
+
+
+def b64(text):
+    return base64.b64encode(text.encode()).decode()
+
+
+def secret_spec(password_secret="smoke-db"):
+    return {"hostname": "sec-0", "grace_seconds": 5, "supplementary_groups": [2000],
+            "volumes": [{"name": "tls", "secret": {"name": "smoke-tls", "mode": 0o440, "group": 2000}},
+                        {"name": "conf", "secret": {"name": "smoke-tls", "group": 2000,
+                                                    "items": [{"key": "tls.crt", "path": "certs/ca.pem"}]}}],
+            "containers": [{"name": "app", "image": IMAGE, "user": 1000, "group": 1000, "read_only_root": True,
+                            "command": ["/bin/sh", "-c", "trap 'exit 0' TERM; while true; do sleep 1; done"],
+                            "env": {"LEVEL": "info"},
+                            "secret_env": {"DB_PASSWORD": {"secret": password_secret, "key": "password"}},
+                            "mounts": [{"volume": "tls", "path": "/etc/apk"},
+                                       {"volume": "conf", "path": "/opt/app/ca.pem", "sub_path": "certs/ca.pem"}]}]}
+
+
+def secret_files(orqos):
+    """Secrets: values never come back; files are written root:group with their mode, bind-mounted read-only and
+    idmapped (replacing the directory); environment values arrive verbatim; data is immutable."""
+    code, body = orqos.call("PUT", "/workload/secrets/smoke-tls",
+                            {"data": {"tls.crt": b64("CERT"), "tls.key": b64("KEY")}, "labels": {"example.org/k": "v"}})
+    ok(code == 200 and body["keys"] == ["tls.crt", "tls.key"], f"PUT creates a secret and lists its keys ({code} {body})")
+    code, body = orqos.call("PUT", "/workload/secrets/smoke-db", {"data": {"password": b64(PASSWORD)}})
+    ok(code == 200, f"a second secret ({code} {body})")
+    code, body = orqos.call("PUT", "/workload/secrets/smoke-tls", {"data": {"tls.crt": b64("OTHER"), "tls.key": b64("KEY")}})
+    ok(code == 409, f"changing a secret's data is refused ({code} {body})")
+    code, body = orqos.call("PUT", "/workload/secrets/smoke-tls",
+                            {"data": {"tls.crt": b64("CERT"), "tls.key": b64("KEY")}, "labels": {"example.org/k": "w"}})
+    ok(code == 200 and body["labels"] == {"example.org/k": "w"}, f"labels can change ({code} {body})")
+    missing = secret_spec("smoke-missing")
+    code, body = orqos.call("PUT", "/workload/pods/sec-missing", missing)
+    ok(code == 422 and "unknown secret" in body["error"], f"a pod naming an unknown secret is refused ({code} {body})")
+    code, body = orqos.call("PUT", "/workload/secrets/smoke-bad", {"data": {"password": b64("line\nbreak")}})
+    bad = secret_spec("smoke-bad")
+    code, body = orqos.call("PUT", "/workload/pods/sec-bad", bad)
+    ok(code == 422 and "control characters" in body["error"],
+       f"a value with a newline cannot become an environment variable ({code} {body})")
+
+    code, body = orqos.call("PUT", "/workload/pods/sec", secret_spec())
+    ok(code == 200, f"apply creates a pod with secret files and environment ({code} {body.get('error') if isinstance(body, dict) else body})")
+    wait_state(orqos, "sec", "running")
+    out = sh("podman", "exec", "orqos-sec-app", "sh", "-c",
+             "stat -c '%u %g %a %n' /etc/apk /etc/apk/tls.key /opt/app/ca.pem; ls /etc/apk | tr '\\n' ' '; echo; "
+             "cat /etc/apk/tls.key /opt/app/ca.pem; echo; printf '[%s]' \"$DB_PASSWORD\"; echo; "
+             "touch /etc/apk/x 2>/dev/null || echo read-only")
+    lines = out.splitlines()
+    ok(lines[0] == "0 2000 550 /etc/apk" and lines[1] == "0 2000 440 /etc/apk/tls.key"
+       and lines[2] == "0 2000 644 /opt/app/ca.pem",
+       f"files and directories are root:2000 with their modes inside the pod ({lines[:3]})")
+    ok(lines[3].split() == ["tls.crt", "tls.key"], f"a secret volume replaces the image's directory ({lines[3]})")
+    ok(lines[4] == "KEYCERT", f"user 1000 with the group reads the files, including a sub_path file ({lines[4]})")
+    ok(lines[5] == f"[{PASSWORD}]", f"the environment value arrives verbatim ({lines[5]})")
+    ok(lines[6] == "read-only", "secret files are read-only")
+    denied = subprocess.run(["podman", "run", "--rm", "--userns=auto:size=65536", "--user", "1001", "--mount",
+                             f"type=bind,source={FILES}/sec/tls,destination=/t,ro,idmap", IMAGE, "cat", "/t/tls.key"],
+                            capture_output=True)
+    ok(denied.returncode != 0, "a container without the group cannot read 0440 files")
+    on_disk = os.path.join(FILES, "sec", "tls", "tls.key")
+    ok(owner_mode(on_disk) == "0:2000 440" and owner_mode(FILES) == "0:0 700",
+       f"on disk the files are root:2000 under a root-only directory ({owner_mode(on_disk)}, {owner_mode(FILES)})")
+
+    code, pod = orqos.call("GET", "/workload/pods/sec")
+    code2, listed = orqos.call("GET", "/workload/secrets")
+    leaked = [text for text in (json.dumps(pod), json.dumps(listed)) if "KEY" in text.replace("tls.key", "") or "w%rd" in text]
+    ok(code == 200 and code2 == 200 and not leaked, "values appear in neither the pod nor the secrets listing")
+    tls = next((s for s in listed if s["name"] == "smoke-tls"), {})
+    ok(tls.get("pods") == ["sec"], f"the secrets endpoint lists the pods using a secret ({tls})")
+    code, _ = orqos.call("DELETE", "/workload/secrets/smoke-tls")
+    ok(code == 409, "a secret in use cannot be deleted")
+
+    orqos.call("DELETE", "/workload/pods/sec")
+    ok(not os.path.exists(os.path.join(FILES, "sec")), "removing the pod removes its secret files")
+    for name in ("smoke-tls", "smoke-db", "smoke-bad"):
+        code, _ = orqos.call("DELETE", f"/workload/secrets/{name}")
+        ok(code == 200, f"DELETE removes the unused secret {name}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--orqos", required=True, help="path to the orqos binary")
@@ -358,13 +441,16 @@ def main():
         run(orqos)
         networks(orqos)
         storage(orqos)
+        secret_files(orqos)
         print("workload smoke: all checks passed")
     finally:
         try:
             if orqos.process.poll() is None:
-                for pod in ("smoke", "web0", "web1", "other", "nettaken", "st", "st2", "st-unknown"):
+                for pod in ("smoke", "web0", "web1", "other", "nettaken", "st", "st2", "st-unknown", "sec"):
                     orqos.call("DELETE", f"/workload/pods/{pod}")
                 orqos.call("DELETE", "/workload/volumes/smoke-data")
+                for name in ("smoke-tls", "smoke-db", "smoke-bad"):
+                    orqos.call("DELETE", f"/workload/secrets/{name}")
         except Exception:  # cleanup must continue
             pass
         orqos.stop()
