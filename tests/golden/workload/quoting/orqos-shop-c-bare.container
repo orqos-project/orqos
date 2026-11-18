@@ -10,6 +10,9 @@ Image=alpine:3.22
 Exec="a b" "quote\"d" "$$X" "50%%"
 Label=dev.orqos.owner=0123456789abcdef0123456789abcdef
 Label=dev.orqos.pod=shop
+Label=app.example/tier=batch
+Label=dev.rezn.owner=0f0f
+Label=dev.rezn.resource=queue
 StopTimeout=30
 
 [Service]

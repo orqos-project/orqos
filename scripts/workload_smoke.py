@@ -89,6 +89,7 @@ def container_id(name):
 SPEC = {
     "hostname": "smoke-0",
     "grace_seconds": 5,
+    "labels": {"example.org/app": "smoke"},
     "containers": [
         {"name": "server", "image": IMAGE,
          "command": ["/bin/sh", "-c", "while true; do echo pong | nc -l -p 8080; done"]},
@@ -127,6 +128,7 @@ def run(orqos):
     labels = json.loads(sh("podman", "pod", "inspect", "orqos-smoke", "--format", "json"))
     labels = (labels[0] if isinstance(labels, list) else labels)["Labels"]
     ok("dev.orqos.owner" in labels and labels["dev.orqos.pod"] == "smoke", "the Podman pod carries ownership labels")
+    ok(labels.get("example.org/app") == "smoke", "the Podman pod carries the spec's labels")
 
     before = {c: container_id(f"orqos-smoke-{c}") for c in ("server", "client")}
     code, _ = orqos.call("PUT", "/workload/pods/smoke", SPEC)
