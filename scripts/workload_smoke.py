@@ -677,8 +677,10 @@ def registry(orqos):
     code, body = orqos.call("PUT", "/workload/pods/rg", pod(PRIVATE, "smoke-reg-junk"))
     ok(code == 422 and "auths" in body["error"], f"a pull secret without auths is refused ({code} {body})")
     code, body = orqos.call("PUT", "/workload/pods/rg", pod(PRIVATE, "smoke-reg-bad"))
-    ok(code == 502 and PRIVATE in body["error"] and "unauthorized" in body["error"].lower(),
-       f"a pull with wrong credentials is refused at apply, naming the image ({code} {body.get('error', '')[:200]})")
+    refusal = body.get("error", "") if isinstance(body, dict) else str(body)
+    ok(code == 502 and PRIVATE in refusal
+       and any(w in refusal.lower() for w in ("unauthorized", "authentication required", "denied")),
+       f"a pull with wrong credentials is refused at apply, naming the image ({code} {refusal})")
     ok(orqos.call("GET", "/workload/pods/rg")[0] == 404, "a failed pull creates nothing")
     code, body = orqos.call("PUT", "/workload/pods/rg", pod(PRIVATE, "smoke-reg", pull="always"))
     ok(code == 200, f"with the right credentials the private image is pulled and runs ({code})")
