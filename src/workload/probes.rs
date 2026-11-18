@@ -639,6 +639,16 @@ mod tests {
             .env("ORQOS_PROBE", "another")
             .spawn()
             .unwrap();
+        // Until the child has exec'd, /proc shows the parent's environment: wait for the token to appear.
+        let environ = format!("/proc/{}/environ", child.id());
+        for _ in 0..200 {
+            if std::fs::read(&environ)
+                .is_ok_and(|e| e.windows(token.len()).any(|w| w == token.as_bytes()))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert_eq!(kill_tagged(token), 1);
         assert!(!child.wait().unwrap().success());
         assert!(
