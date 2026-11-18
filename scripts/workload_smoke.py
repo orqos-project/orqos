@@ -10,6 +10,7 @@ removed at the end, including after a failure.
 import argparse
 import json
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -300,7 +301,9 @@ def storage(orqos):
              "echo d > /disk/d && echo wrote; touch /x 2>/dev/null || echo read-only; "
              "touch /ro/x 2>/dev/null || echo ro-mount; head -c 2000000 /dev/zero > /mem/big 2>/dev/null || echo mem-full; "
              "rm -f /mem/big")
-    ok("uid=1000 gid=1000" in out and "2000" in out.split("groups=")[1], f"runs as 1000:1000 with group 2000 ({out.splitlines()[0]})")
+    ident = out.splitlines()[0]
+    ok(re.search(r"uid=1000\b", ident) and re.search(r"gid=1000\b", ident)
+       and re.search(r"[=,]2000\b", ident.split("groups=")[1]), f"runs as 1000:1000 with group 2000 ({ident})")
     ok("CapEff:\t0000000000000000" in out and "NoNewPrivs:\t1" in out, "no capabilities and no privilege escalation")
     ok("wrote" in out and "read-only" in out and "ro-mount" in out,
        "volumes are writable while the root filesystem and read-only mounts are not")
