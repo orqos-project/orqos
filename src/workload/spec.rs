@@ -334,6 +334,94 @@ pub struct ContainerSpec {
     pub drop_all_capabilities: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mounts: Vec<MountSpec>,
+    /// Until it succeeds, no other probe runs and the container is not started; reaching its failure threshold
+    /// restarts the container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup: Option<Probe>,
+    /// Decides whether the container is ready; never restarts it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness: Option<Probe>,
+    /// Reaching its failure threshold restarts the container (under the pod's restart policy).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub liveness: Option<Probe>,
+}
+
+/// A probe Orqos runs every `period_seconds`: `exec` inside the container, or an HTTP(S) `GET` from outside it,
+/// inside the pod's network namespace (so images need no HTTP client).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Probe {
+    /// Command run with `podman exec` as the container's user; exit status 0 succeeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http: Option<HttpProbe>,
+    pub period_seconds: u32,
+    pub timeout_seconds: u32,
+    /// Consecutive failures that make the probe fail.
+    pub failure_threshold: u32,
+}
+
+/// `GET http(s)://127.0.0.1:<port><path>` in the pod's network namespace. Statuses 200–399 succeed; `https` does not
+/// verify the certificate.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HttpProbe {
+    pub path: String,
+    pub port: u16,
+    pub scheme: Scheme,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Scheme {
+    Http,
+    Https,
+}
+
+impl Probe {
+    fn validate(&self, at: &str) -> Result<(), String> {
+        match (&self.exec, &self.http) {
+            (Some(argv), None) => {
+                if argv.is_empty() || argv.len() > 64 {
+                    return Err(format!("{at}.exec: 1 to 64 arguments"));
+                }
+                if argv.iter().any(|a| has_control(a)) {
+                    return Err(format!("{at}.exec: control characters are not allowed"));
+                }
+            }
+            (None, Some(http)) => {
+                let path_ok = http.path.starts_with('/')
+                    && http.path.len() <= 1024
+                    && http
+                        .path
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:@/?%".contains(&b));
+                if !path_ok {
+                    return Err(format!(
+                        "{at}.http.path: an absolute path of URI characters, at most 1024"
+                    ));
+                }
+                if http.port == 0 {
+                    return Err(format!("{at}.http.port: 1 to 65535"));
+                }
+            }
+            _ => return Err(format!("{at}: exactly one of exec or http")),
+        }
+        if !(1..=3600).contains(&self.period_seconds) {
+            return Err(format!("{at}.period_seconds: 1 to 3600"));
+        }
+        if !(1..=300).contains(&self.timeout_seconds) || self.timeout_seconds > self.period_seconds
+        {
+            return Err(format!(
+                "{at}.timeout_seconds: 1 to 300, and at most period_seconds"
+            ));
+        }
+        if !(1..=1000).contains(&self.failure_threshold) {
+            return Err(format!("{at}.failure_threshold: 1 to 1000"));
+        }
+        Ok(())
+    }
 }
 
 /// Pod IDs become unit, pod and container names, so they are shorter than DNS labels (as in host mode).
@@ -592,6 +680,15 @@ impl PodSpec {
                     ));
                 }
             }
+            for (kind, probe) in [
+                ("startup", &c.startup),
+                ("readiness", &c.readiness),
+                ("liveness", &c.liveness),
+            ] {
+                if let Some(probe) = probe {
+                    probe.validate(&format!("{at}.{kind}"))?;
+                }
+            }
             if c.env.len() + c.secret_env.len() > 256 {
                 return Err(format!("{at}: at most 256 environment variables"));
             }
@@ -833,6 +930,51 @@ mod tests {
             json!({"X": {"secret": "s", "key": "."}})
         )
         .contains(".key"));
+    }
+
+    #[test]
+    fn probes_are_checked() {
+        let mut v = minimal();
+        v["containers"][0]["startup"] = json!({"exec": ["test", "-f", "/tmp/started"], "period_seconds": 5, "timeout_seconds": 1, "failure_threshold": 60});
+        v["containers"][0]["readiness"] = json!({"http": {"path": "/health/ready?full=1", "port": 8080, "scheme": "https"}, "period_seconds": 10, "timeout_seconds": 3, "failure_threshold": 3});
+        v["containers"][0]["liveness"] = json!({"http": {"path": "/", "port": 80, "scheme": "http"}, "period_seconds": 10, "timeout_seconds": 1, "failure_threshold": 3});
+        let ok = spec(v.clone()).unwrap();
+        assert_eq!(
+            ok.containers[0]
+                .readiness
+                .as_ref()
+                .unwrap()
+                .http
+                .as_ref()
+                .unwrap()
+                .scheme,
+            Scheme::Https
+        );
+        let broken = |pointer: &str, value: serde_json::Value| {
+            let mut b = v.clone();
+            *b.pointer_mut(pointer).unwrap() = value;
+            spec(b).unwrap_err()
+        };
+        assert!(broken("/containers/0/startup/exec", json!([])).contains("1 to 64"));
+        assert!(broken("/containers/0/startup/exec", json!(["a\nb"])).contains("control"));
+        assert!(broken("/containers/0/readiness/http/path", json!("health")).contains(".path"));
+        assert!(broken("/containers/0/readiness/http/path", json!("/a b")).contains(".path"));
+        assert!(broken("/containers/0/readiness/http/port", json!(0)).contains("1 to 65535"));
+        assert!(
+            broken("/containers/0/liveness/period_seconds", json!(0)).contains("period_seconds")
+        );
+        assert!(broken("/containers/0/liveness/timeout_seconds", json!(11))
+            .contains("at most period_seconds"));
+        assert!(broken("/containers/0/liveness/failure_threshold", json!(0))
+            .contains("failure_threshold"));
+        assert!(broken("/containers/0/liveness", json!({"exec": ["true"], "http": {"path": "/", "port": 1, "scheme": "http"}, "period_seconds": 1, "timeout_seconds": 1, "failure_threshold": 1})).contains("exactly one"));
+        // Every field is explicit: no defaults to drift between client and server.
+        let mut missing = v.clone();
+        missing["containers"][0]["liveness"]
+            .as_object_mut()
+            .unwrap()
+            .remove("timeout_seconds");
+        assert!(spec(missing).is_err());
     }
 
     #[test]

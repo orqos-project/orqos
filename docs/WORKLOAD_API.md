@@ -4,9 +4,9 @@
 generator. It is the execution layer for [Rezn](https://github.com/rezn-project/rezn)'s IR v2 programs (Rezn ADR
 0001). This first version covers backend selection and host checks (#16), owned unit lifecycle (#17) and pods
 with a shared network namespace and hostname (#18), owned pod networks with DNS aliases (part of #25), container
-identity and hardening (#20), scratch volumes (#21), owned volumes (#22) and secret files and environment
-variables (#24). Init containers and sidecars, image pulls, live network membership changes, probes, fuller
-observation and reboot recovery follow in #19–#28.
+identity and hardening (#20), scratch volumes (#21), owned volumes (#22), secret files and environment
+variables (#24) and startup, readiness and liveness probes (#26). Init containers and sidecars, image pulls, live
+network membership changes, fuller observation and reboot recovery follow in #19–#28.
 
 ## Prerequisites
 
@@ -104,6 +104,7 @@ error), and **401** without the bearer token.
 | `containers[].read_only_root` | Read-only root filesystem (Podman keeps tmpfs on `/dev`, `/run`, `/tmp`, `/var/tmp`; a mount over one replaces it). |
 | `containers[].no_new_privileges` | `no-new-privileges`: setuid binaries and file capabilities grant nothing. |
 | `containers[].drop_all_capabilities` | Drops every capability. Podman's default seccomp profile always applies. |
+| `containers[].startup`, `.readiness`, `.liveness` | Optional probes, below. |
 | `containers[].mounts` | Up to 32 `{volume, path, read_only?, sub_path?}`: a pod volume at an absolute `path` (letters, digits, `/ . _ - + @`, no `..`), optionally a relative `sub_path` inside it. |
 | `supplementary_groups` | Up to 16 extra GIDs of every container (at most 65535). The first owns the pod's scratch volumes. |
 | `volumes` | Up to 32 `{name, volume}` (an owned volume, which must exist), `{name, secret: {name, items?, mode?, group?}}` (files from an owned secret, below) or `{name, scratch: {medium, bytes}}`. `memory` scratch is a tmpfs of `bytes`; `disk` scratch is a local volume (`bytes` advisory). Scratch volumes are empty when the pod is created or replaced, shared by its containers, kept across container restarts and removed with the pod. Their root is `root:<first supplementary group>` 2775, or 0777 without one. |
@@ -115,11 +116,38 @@ error), and **401** without the bearer token.
 
 Control characters are rejected everywhere. Unknown fields are rejected.
 
+### Probes
+
+A probe is exactly one of `{"exec": [argv]}` or `{"http": {"path", "port", "scheme": "http" | "https"}}`, with
+`period_seconds` (1–3600), `timeout_seconds` (1–300, at most the period) and `failure_threshold` (1–1000), all
+required:
+
+```json
+"readiness": {"http": {"path": "/health/ready", "port": 8080, "scheme": "https"},
+              "period_seconds": 10, "timeout_seconds": 3, "failure_threshold": 3}
+```
+
+Orqos runs them itself (not as Podman healthchecks, which allow one check per container and run inside it):
+
+- `exec` runs with `podman exec` as the container's user; exit status 0 succeeds. The process gets
+  `ORQOS_PROBE=<random token>` in its environment; on timeout Orqos kills every process carrying the token, since a
+  timed-out `podman exec` would leave it running in the container.
+- `http` sends `GET <path>` to `127.0.0.1:<port>` **from outside the container, inside the pod's network
+  namespace** (a short-lived thread enters it with `setns`), so images need no HTTP client. Statuses 200–399
+  succeed; `https` does not verify the certificate.
+- Until the startup probe succeeds, no other probe runs and the container is not `started`. Readiness turns false
+  after `failure_threshold` consecutive failures and true after one success; it never restarts anything. Startup
+  and liveness reaching their threshold stop the container (`podman stop -t <grace_seconds>`), so the pod's
+  `restart` policy decides what follows (`never` leaves it down).
+- A new container instance starts over: not started, not ready. Probes resume when Orqos restarts.
+
 ### Observed state
 
 Each pod reports `desired` (`running` or `stopped`), a summary `state` (`running`, `starting`, `restarting`,
-`degraded`, `failed` or `stopped`), the pod unit and every container unit (`active_state`, `sub_state`,
-`result`, `restarts`), its spec and the last operation `error`.
+`degraded`, `failed` or `stopped`), `ready` (it runs and every container is ready), the pod unit and every
+container unit (`active_state`, `sub_state`, `result`, `restarts`), with each container's `started`, `ready`,
+`probe_restarts` and `last_probe_failure` (without probes, a running container is started and ready), its spec and
+the last operation `error`.
 
 ## Lifecycle and ownership
 
@@ -172,5 +200,5 @@ Each pod reports `desired` (`running` or `stopped`), a summary `state` (`running
 `cargo test` covers spec validation, network bookkeeping, unit rendering (golden files in `tests/golden/workload/`, accepted by the
 Quadlet generator), ownership rules, backend selection and route mounting. `sudo python3
 scripts/workload_smoke.py --orqos target/debug/orqos` runs the live lifecycle against real systemd and Podman, including network
-aliases, isolation, volumes, secret files and cleanup; the
+aliases, isolation, volumes, secret files, probes and cleanup; the
 *Workload backend* workflow runs it on Ubuntu 26.04 for every push and pull request.

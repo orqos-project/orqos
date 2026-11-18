@@ -47,6 +47,9 @@ dashmap = "6.1.0"
 tokio-util = { version = "0.7", features = ["io"] }
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+libc = "0.2.174"
+rustls = { version = "0.23.31", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26.2", default-features = false, features = ["ring", "tls12", "logging"] }
 
 [dev-dependencies]
 tower = { version = "0.5.2", features = ["util"] }

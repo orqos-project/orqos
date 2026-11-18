@@ -427,6 +427,106 @@ def secret_files(orqos):
         ok(code == 200, f"DELETE removes the unused secret {name}")
 
 
+RESPONDER = ("while true; do if [ -f /tmp/ready ]; then s='200 OK'; else s='503 Service Unavailable'; fi; "
+             "printf \"HTTP/1.1 $s\\r\\nContent-Length: 0\\r\\nConnection: close\\r\\n\\r\\n\" | nc -l -p 8080; done")
+TLS_SERVER = ("apk add --no-cache openssl >/dev/null 2>&1 && openssl req -x509 -newkey ec -pkeyopt "
+              "ec_paramgen_curve:P-256 -nodes -keyout /tmp/k -out /tmp/c -subj /CN=x -days 1 2>/dev/null && "
+              "exec openssl s_server -quiet -www -accept 8443 -cert /tmp/c -key /tmp/k")
+
+
+def probe(action, period=1, timeout=1, threshold=1):
+    return {**action, "period_seconds": period, "timeout_seconds": timeout, "failure_threshold": threshold}
+
+
+def container_state(orqos, pod, name):
+    code, status = orqos.call("GET", f"/workload/pods/{pod}")
+    assert code == 200, status
+    return status, next(c for c in status["containers"] if c["name"] == name)
+
+
+def until(description, check, seconds=120):
+    deadline = time.time() + seconds
+    last = None
+    while time.time() < deadline:
+        last = check()
+        if last:
+            return last
+        time.sleep(0.5)
+    raise AssertionError(f"timed out waiting for {description}")
+
+
+def probes(orqos):
+    """Startup gates readiness and liveness; readiness follows HTTP(S) answers from inside the pod's network
+    namespace; failing liveness restarts the container under its restart policy; timed-out exec probes leave no
+    process behind."""
+    spec = {"hostname": "pr-0", "grace_seconds": 2, "containers": [
+        {"name": "app", "image": IMAGE, "command": ["/bin/sh", "-c", RESPONDER],
+         "startup": probe({"exec": ["test", "-f", "/tmp/started"]}),
+         "readiness": probe({"http": {"path": "/ready", "port": 8080, "scheme": "http"}}),
+         "liveness": probe({"exec": ["/bin/sh", "-c", "test ! -f /tmp/dead"]}, threshold=2)},
+        {"name": "tls", "image": IMAGE, "command": ["/bin/sh", "-c", TLS_SERVER],
+         "readiness": probe({"http": {"path": "/", "port": 8443, "scheme": "https"}}, period=2, timeout=2)},
+        {"name": "slow", "image": IMAGE, "command": ["sleep", "infinity"],
+         "readiness": probe({"exec": ["sleep", "30"]}, period=3, timeout=1)},
+    ]}
+    code, body = orqos.call("PUT", "/workload/pods/pr", spec)
+    ok(code == 200, f"apply creates a pod with probes ({code} {body.get('error') if isinstance(body, dict) else ''})")
+    wait_state(orqos, "pr", "running")
+    status, app = container_state(orqos, "pr", "app")
+    ok(not app["started"] and not app["ready"] and not status["ready"],
+       f"before its startup probe passes a container is neither started nor ready ({app})")
+    sh("podman", "exec", "orqos-pr-app", "touch", "/tmp/started")
+    app = until("startup", lambda: (lambda c: c if c["started"] else None)(container_state(orqos, "pr", "app")[1]))
+    time.sleep(2)
+    _, app = container_state(orqos, "pr", "app")
+    ok(app["started"] and not app["ready"] and "HTTP 503" in (app["last_probe_failure"] or ""),
+       f"once started, readiness follows the HTTP answer from inside the pod ({app})")
+    sh("podman", "exec", "orqos-pr-app", "touch", "/tmp/ready")
+    until("app readiness", lambda: container_state(orqos, "pr", "app")[1]["ready"])
+    tls = until("HTTPS readiness", lambda: (lambda c: c if c["ready"] else None)(container_state(orqos, "pr", "tls")[1]),
+                seconds=180)
+    ok(tls["ready"], "an HTTPS probe passes against a self-signed certificate")
+    _, slow = container_state(orqos, "pr", "slow")
+    ok(not slow["ready"] and "timed out" in (slow["last_probe_failure"] or ""), f"a hanging exec probe times out ({slow})")
+    time.sleep(1)
+    left = sh("podman", "exec", "orqos-pr-slow", "ps", "-o", "args")
+    ok("sleep 30" not in left, f"timed-out exec probes leave no process behind ({left.splitlines()})")
+    status, _ = container_state(orqos, "pr", "app")
+    ok(not status["ready"], "a pod is ready only when every container is")
+
+    sh("podman", "exec", "orqos-pr-app", "rm", "/tmp/ready")
+    until("unreadiness", lambda: not container_state(orqos, "pr", "app")[1]["ready"])
+    _, app = container_state(orqos, "pr", "app")
+    ok(app["restarts"] == 0 and app["probe_restarts"] == 0,
+       "failing readiness makes a container unready without restarting it")
+
+    before = container_id("orqos-pr-app")
+    sh("podman", "exec", "orqos-pr-app", "touch", "/tmp/dead")
+    app = until("a liveness restart", lambda: (lambda c: c if c["probe_restarts"] >= 1 else None)(
+        container_state(orqos, "pr", "app")[1]))
+    until("the restarted container", lambda: subprocess.run(
+        ["podman", "inspect", "--format", "{{.State.Running}}", "orqos-pr-app"],
+        capture_output=True, text=True).stdout.strip() == "true")
+    ok(container_id("orqos-pr-app") != before and "liveness" in app["last_probe_failure"],
+       f"failing liveness restarts the container ({app['probe_restarts']} probe restarts)")
+    time.sleep(2)
+    _, app = container_state(orqos, "pr", "app")
+    ok(not app["started"], "a restarted container starts over: not started until its startup probe passes")
+
+    never = {"hostname": "pn-0", "grace_seconds": 2, "restart": "never", "containers": [
+        {"name": "app", "image": IMAGE, "command": ["sleep", "infinity"],
+         "liveness": probe({"exec": ["false"]})}]}
+    code, _ = orqos.call("PUT", "/workload/pods/pn", never)
+    ok(code == 200, "apply creates a pod with restart: never")
+    until("the never-restart liveness stop", lambda: container_state(orqos, "pn", "app")[1]["probe_restarts"] >= 1)
+    time.sleep(4)
+    status, app = container_state(orqos, "pn", "app")
+    ok(app["active_state"] != "active" and not status["ready"],
+       f"with restart: never a failed liveness probe leaves the container down ({app['active_state']})")
+    for pod in ("pr", "pn"):
+        orqos.call("DELETE", f"/workload/pods/{pod}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--orqos", required=True, help="path to the orqos binary")
@@ -442,11 +542,12 @@ def main():
         networks(orqos)
         storage(orqos)
         secret_files(orqos)
+        probes(orqos)
         print("workload smoke: all checks passed")
     finally:
         try:
             if orqos.process.poll() is None:
-                for pod in ("smoke", "web0", "web1", "other", "nettaken", "st", "st2", "st-unknown", "sec"):
+                for pod in ("smoke", "web0", "web1", "other", "nettaken", "st", "st2", "st-unknown", "sec", "pr", "pn"):
                     orqos.call("DELETE", f"/workload/pods/{pod}")
                 orqos.call("DELETE", "/workload/volumes/smoke-data")
                 for name in ("smoke-tls", "smoke-db", "smoke-bad"):
