@@ -11,6 +11,14 @@ pub struct PodSpec {
     /// Hostname inside every container of the pod (DNS label, at most 63 characters).
     pub hostname: String,
     pub containers: Vec<ContainerSpec>,
+    /// Run once, in order, before sidecars and containers start; each must succeed before the next. A failure is
+    /// retried under the pod's restart policy (never: the pod start fails).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub init: Vec<ContainerSpec>,
+    /// Started after the init containers and before `containers`, always restarted, stopped after `containers`.
+    /// When a sidecar has a startup probe, `containers` start only once every such probe has passed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sidecars: Vec<ContainerSpec>,
     /// Restart policy of every container. Restarts back off from 1 s to 5 minutes.
     #[serde(default)]
     pub restart: Restart,
@@ -242,6 +250,26 @@ impl SecretFiles {
                 .map(|i| (i.key.as_str(), i.path.as_str()))
                 .collect(),
             None => keys.map(|k| (k, k)).collect(),
+        }
+    }
+}
+
+/// Where a container sits in its pod's lifecycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerKind {
+    Init,
+    Sidecar,
+    Container,
+}
+
+impl ContainerKind {
+    /// The spec field listing containers of this kind.
+    pub fn field(self) -> &'static str {
+        match self {
+            ContainerKind::Init => "init",
+            ContainerKind::Sidecar => "sidecars",
+            ContainerKind::Container => "containers",
         }
     }
 }
@@ -514,15 +542,32 @@ impl PodSpec {
         self.volumes.iter().filter_map(|v| v.volume.as_deref())
     }
 
+    /// Every container with its kind: init containers in order, then sidecars, then containers.
+    pub fn every_container(&self) -> impl Iterator<Item = (ContainerKind, &ContainerSpec)> {
+        self.init
+            .iter()
+            .map(|c| (ContainerKind::Init, c))
+            .chain(self.sidecars.iter().map(|c| (ContainerKind::Sidecar, c)))
+            .chain(
+                self.containers
+                    .iter()
+                    .map(|c| (ContainerKind::Container, c)),
+            )
+    }
+
+    /// Whether some sidecar has a startup probe, which then gates the start of `containers`.
+    pub fn gated(&self) -> bool {
+        self.sidecars.iter().any(|c| c.startup.is_some())
+    }
+
     /// Names of the owned secrets the pod uses, as files or environment variables.
     pub fn secrets(&self) -> BTreeSet<&str> {
         self.volumes
             .iter()
             .filter_map(|v| v.secret.as_ref().map(|s| s.name.as_str()))
             .chain(
-                self.containers
-                    .iter()
-                    .flat_map(|c| c.secret_env.values().map(|r| r.secret.as_str())),
+                self.every_container()
+                    .flat_map(|(_, c)| c.secret_env.values().map(|r| r.secret.as_str())),
             )
             .collect()
     }
@@ -603,9 +648,22 @@ impl PodSpec {
                 }
             }
         }
+        if self.init.len() + self.sidecars.len() + self.containers.len() > 32 {
+            return Err("at most 32 containers in all".into());
+        }
         let mut names = BTreeSet::new();
-        for (i, c) in self.containers.iter().enumerate() {
-            let at = format!("containers[{i}]");
+        let mut index: BTreeMap<ContainerKind, usize> = BTreeMap::new();
+        for (kind, c) in self.every_container() {
+            let i = index.entry(kind).or_default();
+            let at = format!("{}[{i}]", kind.field());
+            *i += 1;
+            if kind == ContainerKind::Init
+                && (c.startup.is_some() || c.readiness.is_some() || c.liveness.is_some())
+            {
+                return Err(format!(
+                    "{at}: init containers have no probes (they run to completion)"
+                ));
+            }
             if !is_label(&c.name, 63) {
                 return Err(format!("{at}.name: a DNS label of at most 63 characters"));
             }
@@ -975,6 +1033,56 @@ mod tests {
             .unwrap()
             .remove("timeout_seconds");
         assert!(spec(missing).is_err());
+    }
+
+    #[test]
+    fn init_containers_and_sidecars_are_checked() {
+        let mut v = minimal();
+        v["init"] = json!([{"name": "prepare", "image": "alpine:3.22"}, {"name": "trust", "image": "alpine:3.22"}]);
+        v["sidecars"] = json!([{"name": "credentials", "image": "alpine:3.22",
+            "startup": {"exec": ["test", "-s", "/run/token"], "period_seconds": 5, "timeout_seconds": 1, "failure_threshold": 120},
+            "secret_env": {"TOKEN": {"secret": "rz-app", "key": "token"}}}]);
+        let ok = spec(v.clone()).unwrap();
+        let order: Vec<(ContainerKind, &str)> = ok
+            .every_container()
+            .map(|(k, c)| (k, c.name.as_str()))
+            .collect();
+        assert_eq!(
+            order,
+            [
+                (ContainerKind::Init, "prepare"),
+                (ContainerKind::Init, "trust"),
+                (ContainerKind::Sidecar, "credentials"),
+                (ContainerKind::Container, "web"),
+            ]
+        );
+        assert!(ok.gated());
+        assert!(ok.secrets().contains("rz-app"), "sidecar secrets count");
+        let broken = |pointer: &str, value: serde_json::Value| {
+            let mut b = v.clone();
+            *b.pointer_mut(pointer).unwrap() = value;
+            spec(b).unwrap_err()
+        };
+        assert!(broken("/init/1/name", json!("web")).contains("duplicate container name"));
+        assert!(broken("/sidecars/0/name", json!("prepare")).starts_with("sidecars[0].name"));
+        assert!(broken("/init/0/image", json!("bad image")).starts_with("init[0].image"));
+        let probe = json!({"exec": ["true"], "period_seconds": 1, "timeout_seconds": 1, "failure_threshold": 1});
+        let mut probed = v.clone();
+        probed["init"][0]["readiness"] = probe;
+        assert!(spec(probed)
+            .unwrap_err()
+            .contains("init containers have no probes"));
+        let mut many = v.clone();
+        many["containers"] = json!((0..31)
+            .map(|i| json!({"name": format!("c{i}"), "image": "alpine"}))
+            .collect::<Vec<_>>());
+        assert!(spec(many).unwrap_err().contains("at most 32 containers"));
+        let mut plain = minimal();
+        plain["sidecars"] = json!([{"name": "log", "image": "alpine"}]);
+        assert!(
+            !spec(plain).unwrap().gated(),
+            "only a sidecar startup probe gates"
+        );
     }
 
     #[test]

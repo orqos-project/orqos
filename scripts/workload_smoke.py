@@ -527,6 +527,68 @@ def probes(orqos):
         orqos.call("DELETE", f"/workload/pods/{pod}")
 
 
+def unit_state(unit, prop="ActiveState"):
+    return sh("systemctl", "show", "-p", prop, "--value", unit)
+
+
+def init_and_sidecars(orqos):
+    """Init containers run once, in order, retried in place; a sidecar's startup probe gates the containers; sidecars
+    stop after the containers; restart: never with a failing init leaves the pod failed."""
+    work = [{"volume": "work", "path": "/work"}]
+    flaky = "n=$(cat /work/n 2>/dev/null || echo 0); echo $((n+1)) > /work/n; [ $n -ge 2 ]"
+    sleep = "trap 'exit 0' TERM; while true; do sleep 1; done"
+    spec = {"hostname": "is-0", "grace_seconds": 2,
+            "volumes": [{"name": "work", "scratch": {"medium": "memory", "bytes": 1048576}}],
+            "init": [{"name": "one", "image": IMAGE, "command": ["/bin/sh", "-c", "echo -n 1 > /work/order"], "mounts": work},
+                     {"name": "two", "image": IMAGE, "command": ["/bin/sh", "-c", "echo -n 2 >> /work/order"], "mounts": work},
+                     {"name": "flaky", "image": IMAGE, "command": ["/bin/sh", "-c", flaky], "mounts": work}],
+            "sidecars": [{"name": "side", "image": IMAGE, "mounts": work,
+                          "command": ["/bin/sh", "-c", f"sleep 3; date +%s > /work/token; {sleep}"],
+                          "startup": probe({"exec": ["test", "-s", "/work/token"]}, threshold=60)}],
+            "containers": [{"name": "main", "image": IMAGE, "mounts": work,
+                            "command": ["/bin/sh", "-c", "date +%s > /work/main-start; cat /work/order > /work/main-saw; "
+                                        f"test -s /work/token && echo yes > /work/main-token; {sleep}"]}]}
+    code, body = orqos.call("PUT", "/workload/pods/is", spec)
+    ok(code == 200, f"apply creates a pod with init containers and a gated sidecar ({code} {body.get('error') if isinstance(body, dict) else ''})")
+    until("the main container", lambda: unit_state("orqos-is-c-main.service") == "active", seconds=180)
+    out = sh("podman", "exec", "orqos-is-main", "sh", "-c",
+             "cat /work/order; echo; cat /work/n; cat /work/main-saw; echo; cat /work/main-token; cat /work/token /work/main-start")
+    lines = out.split()
+    ok(lines[0] == "12" and lines[2] == "12", f"init containers ran in order and the main saw their output ({lines})")
+    ok(lines[1] == "3" and unit_state("orqos-is-c-flaky.service", "SubState") == "exited",
+       f"a failing init container is retried in place until it succeeds ({lines[1]} runs)")
+    ok(lines[3] == "yes" and int(lines[5]) >= int(lines[4]),
+       f"the main started only after the sidecar's startup probe passed (token {lines[4]}, main {lines[5]})")
+    status = wait_state(orqos, "is", "running")
+    kinds = [(c["name"], c["kind"]) for c in status["containers"]]
+    ok(kinds == [("one", "init"), ("two", "init"), ("flaky", "init"), ("side", "sidecar"), ("main", "container")],
+       f"status lists every container with its kind ({kinds})")
+    inits = [c for c in status["containers"] if c["kind"] == "init"]
+    ok(all(c["sub_state"] == "exited" for c in inits) and status["ready"],
+       "completed init containers read exited, and the pod is ready")
+
+    since = time.time()
+    orqos.call("POST", "/workload/pods/is/stop")
+    log = sh("journalctl", "--since", f"@{int(since) - 1}", "-o", "short-unix", "--no-pager",
+             "-u", "orqos-is-c-main.service", "-u", "orqos-is-c-side.service")
+    stopped = {u: float(l.split()[0]) for l in log.splitlines() if "Stopped" in l
+               for u in ("main", "side") if f"orqos-is-c-{u}.service" in l or f"-c-{u}" in l}
+    ok(stopped.get("main", 0) <= stopped.get("side", 0) and "side" in stopped,
+       f"containers stop before their sidecars ({stopped})")
+    orqos.call("DELETE", "/workload/pods/is")
+
+    never = {"hostname": "in-0", "restart": "never", "grace_seconds": 2,
+             "init": [{"name": "fail", "image": IMAGE, "command": ["/bin/sh", "-c", "exit 1"]}],
+             "containers": [{"name": "main", "image": IMAGE, "command": ["sleep", "infinity"]}]}
+    code, _ = orqos.call("PUT", "/workload/pods/in", never)
+    until("the failed init", lambda: unit_state("orqos-in-c-fail.service") == "failed", seconds=120)
+    time.sleep(3)
+    _, status = orqos.call("GET", "/workload/pods/in")
+    ok(unit_state("orqos-in-c-main.service") != "active" and status["state"] == "failed" and not status["ready"],
+       f"with restart: never a failing init container fails the pod start ({status['state']})")
+    orqos.call("DELETE", "/workload/pods/in")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--orqos", required=True, help="path to the orqos binary")
@@ -543,11 +605,12 @@ def main():
         storage(orqos)
         secret_files(orqos)
         probes(orqos)
+        init_and_sidecars(orqos)
         print("workload smoke: all checks passed")
     finally:
         try:
             if orqos.process.poll() is None:
-                for pod in ("smoke", "web0", "web1", "other", "nettaken", "st", "st2", "st-unknown", "sec", "pr", "pn"):
+                for pod in ("smoke", "web0", "web1", "other", "nettaken", "st", "st2", "st-unknown", "sec", "pr", "pn", "is", "in"):
                     orqos.call("DELETE", f"/workload/pods/{pod}")
                 orqos.call("DELETE", "/workload/volumes/smoke-data")
                 for name in ("smoke-tls", "smoke-db", "smoke-bad"):

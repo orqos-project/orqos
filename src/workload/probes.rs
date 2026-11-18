@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use utoipa::ToSchema;
 
 use super::render;
-use super::spec::{ContainerSpec, HttpProbe, PodSpec, Probe, Scheme};
+use super::spec::{ContainerKind, ContainerSpec, HttpProbe, PodSpec, Probe, Scheme};
 use super::units;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -409,15 +409,57 @@ async fn run_probe(id: &str, container: &str, probe: &Probe) -> Outcome {
     }
 }
 
+/// Whether every sidecar with a startup probe has passed it, so the pod's containers may start.
+pub fn sidecars_started(id: &str, spec: &PodSpec, states: &States) -> bool {
+    spec.sidecars
+        .iter()
+        .filter(|c| c.startup.is_some())
+        .all(|c| {
+            states
+                .get(&(id.to_string(), c.name.clone()))
+                .is_some_and(|s| s.started)
+        })
+}
+
+/// Opens the gate the pod's containers wait on (`ExecStartPre` in their units).
+fn open_gate(id: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = render::gate_path(id);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    std::fs::write(&path, b"")
+}
+
+/// Closes the gate, so a restarted pod's containers wait for their sidecars again.
+pub fn close_gate(id: &str) {
+    let _ = std::fs::remove_file(render::gate_path(id));
+}
+
 /// Runs a pod's probes until cancelled.
 pub async fn run(id: String, spec: PodSpec, states: States, cancel: CancellationToken) {
     let mut due: BTreeMap<(String, Kind), Instant> = BTreeMap::new();
+    let mut gate_open = false;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => return,
             _ = tokio::time::sleep(Duration::from_secs(1)) => {}
         }
-        for c in spec.containers.iter().filter(|c| has_probes(c)) {
+        if spec.gated() && !gate_open && sidecars_started(&id, &spec, &states) {
+            match open_gate(&id) {
+                Ok(()) => {
+                    gate_open = true;
+                    tracing::info!(pod = %id, "sidecars started; starting the pod's containers");
+                }
+                Err(error) => tracing::warn!(pod = %id, %error, "opening the start gate failed"),
+            }
+        }
+        let probed = spec
+            .every_container()
+            .filter(|(kind, c)| *kind != ContainerKind::Init && has_probes(c))
+            .map(|(_, c)| c);
+        for c in probed {
             let now = Instant::now();
             let probes = [
                 (Kind::Startup, &c.startup),
@@ -657,6 +699,40 @@ mod tests {
         );
         other.kill().unwrap();
         other.wait().unwrap();
+    }
+
+    #[test]
+    fn the_gate_opens_once_every_sidecar_startup_probe_passed() {
+        let probe = serde_json::json!({"exec": ["true"], "period_seconds": 1, "timeout_seconds": 1, "failure_threshold": 1});
+        let spec: PodSpec = serde_json::from_value(serde_json::json!({
+            "hostname": "w", "containers": [{"name": "main", "image": "alpine"}],
+            "sidecars": [{"name": "a", "image": "alpine", "startup": probe},
+                         {"name": "b", "image": "alpine", "startup": probe},
+                         {"name": "log", "image": "alpine"}]
+        }))
+        .unwrap();
+        let states: States = Default::default();
+        assert!(!sidecars_started("p", &spec, &states));
+        states.insert(
+            ("p".into(), "a".into()),
+            ProbeState {
+                started: true,
+                ..Default::default()
+            },
+        );
+        assert!(!sidecars_started("p", &spec, &states), "b has not started");
+        states.insert(
+            ("p".into(), "b".into()),
+            ProbeState {
+                started: true,
+                ..Default::default()
+            },
+        );
+        assert!(
+            sidecars_started("p", &spec, &states),
+            "sidecars without a startup probe do not gate"
+        );
+        assert!(!sidecars_started("q", &spec, &states), "states are per pod");
     }
 
     #[test]

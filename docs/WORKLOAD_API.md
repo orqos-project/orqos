@@ -5,8 +5,8 @@ generator. It is the execution layer for [Rezn](https://github.com/rezn-project/
 0001). This first version covers backend selection and host checks (#16), owned unit lifecycle (#17) and pods
 with a shared network namespace and hostname (#18), owned pod networks with DNS aliases (part of #25), container
 identity and hardening (#20), scratch volumes (#21), owned volumes (#22), secret files and environment
-variables (#24) and startup, readiness and liveness probes (#26). Init containers and sidecars, image pulls, live
-network membership changes, fuller observation and reboot recovery follow in #19–#28.
+variables (#24), startup, readiness and liveness probes (#26), and init containers and sidecars (#19). Image
+pulls, live network membership changes, fuller observation and reboot recovery follow in #23–#28.
 
 ## Prerequisites
 
@@ -94,6 +94,7 @@ error), and **401** without the bearer token.
 | Field | Meaning |
 | --- | --- |
 | `hostname` | Hostname inside every container (DNS label). |
+| `init`, `sidecars` | Optional lists of containers (same fields as `containers`; at most 32 containers in all, names unique across the three lists), below. |
 | `containers[].name` | DNS label of at most 63 characters, unique in the pod. The container is named `orqos-<id>-<name>`. |
 | `containers[].image` | Image reference, pulled when missing. |
 | `containers[].command` | Replaces the image's entrypoint and default command (Kubernetes `command`). |
@@ -115,6 +116,21 @@ error), and **401** without the bearer token.
 | `network` | Optional. Without it the pod uses Podman's default network, which has no DNS. `name` (DNS label, at most 40 characters) selects the owned bridge network `orqos-net-<name>`; `aliases` (at most 64 distinct lowercase DNS names, each dot-separated labels of at most 253 characters, kept in order) resolve to the pod for every other pod on that network. Several pods may share an alias, which then resolves to all of their addresses; names resolve only while the pod runs. Pods on different networks cannot resolve or reach each other: networks are created with netavark's `isolate=strict`, which drops traffic between an owned network and every other bridge network, Podman's default network included, while egress to the outside keeps working. Part of the spec: changing the network or its aliases replaces the pod. |
 
 Control characters are rejected everywhere. Unknown fields are rejected.
+
+### Init containers and sidecars
+
+Every container is its own systemd unit in the pod, ordered by systemd:
+
+- `init` containers are one-shot units (`Type=oneshot`, `RemainAfterExit=yes`) that run **in order**, each requiring
+  the previous one. One that fails is retried in place (`Restart=on-failure` with backoff, `RestartMode=direct`, so
+  the units waiting on it keep waiting) unless the pod's `restart` is `never`, in which case the pod start fails.
+  Init containers take no probes. Once done they read `active` / `exited`.
+- `sidecars` start after the init containers and are always restarted.
+- `containers` start after the init containers and the sidecars (`After=`/`Wants=`, so a sidecar crash does not
+  stop them, and on stop they go first). When a sidecar has a `startup` probe, `containers` wait at an
+  `ExecStartPre` gate until **every** such probe has passed: Orqos then creates
+  `/run/orqos/workload/<id>/sidecars-started` (removed when the pod stops or is replaced).
+- Scratch volumes are pod-level, so init containers, sidecars and containers share them.
 
 ### Probes
 
@@ -144,8 +160,9 @@ Orqos runs them itself (not as Podman healthchecks, which allow one check per co
 ### Observed state
 
 Each pod reports `desired` (`running` or `stopped`), a summary `state` (`running`, `starting`, `restarting`,
-`degraded`, `failed` or `stopped`), `ready` (it runs and every container is ready), the pod unit and every
-container unit (`active_state`, `sub_state`, `result`, `restarts`), with each container's `started`, `ready`,
+`degraded`, `failed` or `stopped`), `ready` (it runs and every sidecar and container is ready), the pod unit and
+every container unit (`kind`: `init`, `sidecar` or `container`; `active_state`, `sub_state`, `result`,
+`restarts`), with each container's `started`, `ready`,
 `probe_restarts` and `last_probe_failure` (without probes, a running container is started and ready), its spec and
 the last operation `error`.
 
@@ -200,5 +217,5 @@ the last operation `error`.
 `cargo test` covers spec validation, network bookkeeping, unit rendering (golden files in `tests/golden/workload/`, accepted by the
 Quadlet generator), ownership rules, backend selection and route mounting. `sudo python3
 scripts/workload_smoke.py --orqos target/debug/orqos` runs the live lifecycle against real systemd and Podman, including network
-aliases, isolation, volumes, secret files, probes and cleanup; the
+aliases, isolation, volumes, secret files, probes, init containers and sidecars, and cleanup; the
 *Workload backend* workflow runs it on Ubuntu 26.04 for every push and pull request.

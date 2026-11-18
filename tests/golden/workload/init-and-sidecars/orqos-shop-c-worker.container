@@ -1,0 +1,26 @@
+# Managed by Orqos for owner 0123456789abcdef0123456789abcdef. Do not edit: the next apply replaces this file.
+[Unit]
+Description=Orqos workload pod shop container worker owner 0123456789abcdef0123456789abcdef
+StartLimitIntervalSec=0
+After=orqos-shop-c-prepare.service
+Requires=orqos-shop-c-prepare.service
+After=orqos-shop-c-credentials.service
+Wants=orqos-shop-c-credentials.service
+
+[Container]
+ContainerName=orqos-shop-worker
+Pod=orqos-shop.pod
+Image=alpine:3.22
+Mount=type=volume,source=orqos-shop-scratch-work,destination=/work,idmap
+Label=dev.orqos.owner=0123456789abcdef0123456789abcdef
+Label=dev.orqos.pod=shop
+StopTimeout=30
+
+[Service]
+ExecStartPre=/bin/sh -c 'until test -e /run/orqos/workload/shop/sidecars-started; do sleep 1; done'
+Restart=always
+TimeoutStartSec=infinity
+RestartSec=1s
+RestartSteps=8
+RestartMaxDelaySec=300s
+TimeoutStopSec=60
