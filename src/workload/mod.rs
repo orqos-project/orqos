@@ -2,6 +2,7 @@
 //! See docs/WORKLOAD_API.md.
 pub mod capabilities;
 pub mod files;
+pub mod probes;
 pub mod render;
 pub mod routes;
 pub mod spec;
@@ -82,12 +83,21 @@ pub struct ContainerStatus {
     pub name: String,
     #[serde(flatten)]
     pub unit: UnitStatus,
+    /// The startup probe has passed (or there is none and the container runs).
+    pub started: bool,
+    /// The readiness probe passes (or there is none and the container has started).
+    pub ready: bool,
+    /// Restarts caused by failing startup or liveness probes since Orqos started.
+    pub probe_restarts: u32,
+    pub last_probe_failure: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct PodStatus {
     pub id: String,
     pub desired: Desired,
+    /// The pod runs and every container is ready.
+    pub ready: bool,
     /// `running`, `starting`, `restarting`, `degraded`, `failed` or `stopped`, derived from the units.
     pub state: String,
     pub pod: UnitStatus,
@@ -206,6 +216,9 @@ pub struct WorkloadState {
     networks: Store<NetworkRecord>,
     volumes: Store<VolumeRecord>,
     secrets: Store<SecretRecord>,
+    probes: probes::States,
+    /// The running prober of each pod with probes.
+    probers: std::sync::Mutex<BTreeMap<String, tokio_util::sync::CancellationToken>>,
     // Serializes every operation: unit files, systemd state and records change together.
     lock: Mutex<()>,
 }
@@ -231,8 +244,48 @@ impl WorkloadState {
             networks,
             volumes,
             secrets,
+            probes: Default::default(),
+            probers: Default::default(),
             lock: Mutex::new(()),
         })
+        .inspect(|state: &Self| {
+            // Pods keep running while Orqos is down; their probes resume with it.
+            match state.store.list() {
+                Ok(records) => {
+                    for record in records.iter().filter(|r| r.desired == Desired::Running) {
+                        state.start_prober(&record.id, &record.spec);
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "listing pods to resume their probes failed"),
+            }
+        })
+    }
+
+    /// Starts (or restarts) the pod's prober if any container has probes.
+    fn start_prober(&self, id: &str, spec: &PodSpec) {
+        self.stop_prober(id);
+        if !spec.containers.iter().any(probes::has_probes) {
+            return;
+        }
+        let token = tokio_util::sync::CancellationToken::new();
+        tokio::spawn(probes::run(
+            id.to_string(),
+            spec.clone(),
+            self.probes.clone(),
+            token.clone(),
+        ));
+        self.probers
+            .lock()
+            .expect("prober registry")
+            .insert(id.to_string(), token);
+    }
+
+    /// Stops the pod's prober and forgets its results.
+    fn stop_prober(&self, id: &str) {
+        if let Some(token) = self.probers.lock().expect("prober registry").remove(id) {
+            token.cancel();
+        }
+        self.probes.retain(|(pod, _), _| pod != id);
     }
 
     pub fn authorized(&self, headers: &axum::http::HeaderMap) -> bool {
@@ -525,15 +578,33 @@ impl WorkloadState {
         let mut containers = Vec::new();
         for c in &record.spec.containers {
             let unit = render::container_unit(&record.id, &c.name);
+            let unit = unit_status(&unit, &units::show(&unit).await?);
+            let active = unit.active_state == "active";
+            let probed = self
+                .probes
+                .get(&(record.id.clone(), c.name.clone()))
+                .map(|s| s.clone())
+                .unwrap_or_default();
+            let (started, ready) = if probes::has_probes(c) {
+                (active && probed.started, active && probed.ready)
+            } else {
+                (active, active)
+            };
             containers.push(ContainerStatus {
                 name: c.name.clone(),
-                unit: unit_status(&unit, &units::show(&unit).await?),
+                unit,
+                started,
+                ready,
+                probe_restarts: probed.probe_restarts,
+                last_probe_failure: probed.last_probe_failure,
             });
         }
+        let state = summarize(&pod, &containers);
         Ok(PodStatus {
             id: record.id.clone(),
             desired: record.desired,
-            state: summarize(&pod, &containers).into(),
+            ready: state == "running" && containers.iter().all(|c| c.ready),
+            state: state.into(),
             pod,
             containers,
             spec: record.spec.clone(),
@@ -575,6 +646,7 @@ impl WorkloadState {
                     }
                 }
                 if record.spec != spec {
+                    self.stop_prober(id);
                     self.stop_units(&record).await?;
                     // A replaced pod starts with empty scratch volumes.
                     self.remove_scratch(id, &record.token, &record.spec).await?;
@@ -627,6 +699,7 @@ impl WorkloadState {
             self.save(&mut record, Some(error.to_string()))?;
             return Err(error);
         }
+        self.start_prober(id, &record.spec);
         self.observe(&record).await
     }
 
@@ -650,6 +723,7 @@ impl WorkloadState {
         .await;
         self.save(&mut record, result.as_ref().err().map(ToString::to_string))?;
         result?;
+        self.start_prober(id, &record.spec);
         self.observe(&record).await
     }
 
@@ -658,6 +732,7 @@ impl WorkloadState {
         let mut record = self.record(id)?;
         self.verify_owned(&record).await?;
         record.desired = Desired::Stopped;
+        self.stop_prober(id);
         let result = self.stop_units(&record).await;
         self.save(&mut record, result.as_ref().err().map(ToString::to_string))?;
         result?;
@@ -669,6 +744,7 @@ impl WorkloadState {
         let _guard = self.lock.lock().await;
         let record = self.record(id)?;
         self.verify_owned(&record).await?;
+        self.stop_prober(id);
         self.stop_units(&record).await?;
         units::uninstall(&self.paths, id, &record.token).await?;
         let name = render::pod_name(id);
@@ -1005,6 +1081,10 @@ mod tests {
             .map(|(a, s)| ContainerStatus {
                 name: "c".into(),
                 unit: unit(a, s, "success"),
+                started: false,
+                ready: false,
+                probe_restarts: 0,
+                last_probe_failure: None,
             })
             .collect()
     }
