@@ -8,7 +8,7 @@
 use std::path::Path;
 
 use super::files::{self, Secrets};
-use super::spec::{ContainerSpec, Medium, PodSpec, Restart};
+use super::spec::{ContainerKind, ContainerSpec, Medium, PodSpec, Restart};
 
 /// What rendering needs beyond the spec: the root of secret files and the values of the secrets the pod uses
 /// (verified to exist, and to be UTF-8 without control characters where they become environment variables).
@@ -55,6 +55,14 @@ pub fn scratch_name(id: &str, volume: &str) -> String {
 /// contents) for the pod's lifetime even while no other container runs.
 fn scratch_hold(volume: &str) -> String {
     format!("/run/orqos-scratch/{volume}")
+}
+
+/// The file whose existence lets a gated pod's containers start: created once every sidecar with a startup probe
+/// has passed it. On tmpfs, so a reboot closes every gate.
+pub fn gate_path(id: &str) -> std::path::PathBuf {
+    std::path::Path::new("/run/orqos/workload")
+        .join(id)
+        .join("sidecars-started")
 }
 
 /// The systemd service Quadlet generates for the pod.
@@ -119,7 +127,7 @@ pub fn render(id: &str, token: &str, spec: &PodSpec, inputs: &Inputs) -> Vec<Fil
         name: format!("{}.pod", pod_name(id)),
         content: render_pod(id, token, spec),
     }];
-    for container in &spec.containers {
+    for (kind, container) in spec.every_container() {
         let base = format!("orqos-{id}-c-{}", container.name);
         if !container.env.is_empty() || !container.secret_env.is_empty() {
             let secret_env = container.secret_env.iter().map(|(k, r)| {
@@ -145,7 +153,7 @@ pub fn render(id: &str, token: &str, spec: &PodSpec, inputs: &Inputs) -> Vec<Fil
         }
         files.push(File {
             name: format!("{base}.container"),
-            content: render_container(id, token, spec, container, &base, inputs.files),
+            content: render_container(id, token, spec, kind, container, &base, inputs.files),
         });
     }
     files
@@ -181,6 +189,7 @@ fn render_container(
     id: &str,
     token: &str,
     spec: &PodSpec,
+    kind: ContainerKind,
     c: &ContainerSpec,
     base: &str,
     files_root: &Path,
@@ -262,19 +271,81 @@ fn render_container(
         client_labels(spec),
         spec.grace_seconds
     ));
-    let restart = match spec.restart {
-        Restart::Always => "always",
-        Restart::OnFailure => "on-failure",
-        Restart::Never => "no",
-    };
+    let (unit, service) = lifecycle(id, spec, kind, c);
     format!(
-        "{header}[Unit]\nDescription={description}\nStartLimitIntervalSec=0\n\n{container}\n\
-         [Service]\nRestart={restart}\nRestartSec=1s\nRestartSteps=8\nRestartMaxDelaySec=300s\n\
-         TimeoutStartSec=600\nTimeoutStopSec={stop}\n",
+        "{header}[Unit]\nDescription={description}\nStartLimitIntervalSec=0\n{unit}\n{container}\n\
+         [Service]\n{service}RestartSec=1s\nRestartSteps=8\nRestartMaxDelaySec=300s\n\
+         TimeoutStopSec={stop}\n",
         header = header(token),
         description = description(id, token, Some(&c.name)),
         stop = spec.grace_seconds + 30,
     )
+}
+
+/// A container's place in the pod's start order, as systemd `[Unit]` dependencies and `[Service]` settings:
+///
+/// - init containers are one-shot units that run in order, each `Requires=` the previous one; a failed one is
+///   retried in place (`RestartMode=direct`, so units waiting on it keep waiting) unless the pod never restarts;
+/// - sidecars and containers require the last init container; sidecars always restart;
+/// - containers start after the sidecars (`Wants=`, so a sidecar crash does not stop them, and they stop first),
+///   and wait at an `ExecStartPre` gate while the pod has sidecars with startup probes that have not all passed.
+fn lifecycle(id: &str, spec: &PodSpec, kind: ContainerKind, c: &ContainerSpec) -> (String, String) {
+    let requires = |name: &str| {
+        let unit = container_unit(id, name);
+        format!("After={unit}\nRequires={unit}\n")
+    };
+    let policy = match spec.restart {
+        Restart::Always => "always",
+        Restart::OnFailure => "on-failure",
+        Restart::Never => "no",
+    };
+    match kind {
+        ContainerKind::Init => {
+            let position = spec.init.iter().position(|i| i.name == c.name).unwrap_or(0);
+            let unit = match position {
+                0 => String::new(),
+                n => requires(&spec.init[n - 1].name),
+            };
+            let restart = if spec.restart == Restart::Never {
+                "no"
+            } else {
+                "on-failure"
+            };
+            (
+                unit,
+                format!(
+                    "Type=oneshot\nRemainAfterExit=yes\nRestart={restart}\nRestartMode=direct\nTimeoutStartSec=infinity\n"
+                ),
+            )
+        }
+        ContainerKind::Sidecar => (
+            spec.init
+                .last()
+                .map(|i| requires(&i.name))
+                .unwrap_or_default(),
+            "Restart=always\nTimeoutStartSec=600\n".into(),
+        ),
+        ContainerKind::Container => {
+            let mut unit = spec
+                .init
+                .last()
+                .map(|i| requires(&i.name))
+                .unwrap_or_default();
+            for sidecar in &spec.sidecars {
+                let name = container_unit(id, &sidecar.name);
+                unit.push_str(&format!("After={name}\nWants={name}\n"));
+            }
+            let service = if spec.gated() {
+                format!(
+                    "ExecStartPre=/bin/sh -c 'until test -e {}; do sleep 1; done'\nRestart={policy}\nTimeoutStartSec=infinity\n",
+                    gate_path(id).display()
+                )
+            } else {
+                format!("Restart={policy}\nTimeoutStartSec=600\n")
+            };
+            (unit, service)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -416,6 +487,63 @@ mod tests {
                     ]
                 }]
             }),
+        );
+    }
+
+    #[test]
+    fn renders_init_containers_and_gated_sidecars() {
+        let probe = serde_json::json!({"exec": ["test", "-s", "/work/token"], "period_seconds": 5,
+                                       "timeout_seconds": 1, "failure_threshold": 120});
+        golden(
+            "init-and-sidecars",
+            serde_json::json!({
+                "hostname": "worker-0",
+                "volumes": [{"name": "work", "scratch": {"medium": "memory", "bytes": 1048576}}],
+                "init": [
+                    {"name": "trust", "image": "alpine:3.22", "command": ["/bin/sh", "-c", "echo 1 > /work/order"],
+                     "mounts": [{"volume": "work", "path": "/work"}]},
+                    {"name": "prepare", "image": "alpine:3.22", "command": ["/bin/sh", "-c", "echo 2 >> /work/order"],
+                     "mounts": [{"volume": "work", "path": "/work"}]}
+                ],
+                "sidecars": [{"name": "credentials", "image": "alpine:3.22", "startup": probe,
+                              "mounts": [{"volume": "work", "path": "/work"}]}],
+                "containers": [{"name": "worker", "image": "alpine:3.22",
+                                "mounts": [{"volume": "work", "path": "/work"}]}]
+            }),
+        );
+        let never: PodSpec = serde_json::from_value(serde_json::json!({
+            "hostname": "job-0", "restart": "never",
+            "init": [{"name": "wait", "image": "alpine:3.22"}],
+            "containers": [{"name": "job", "image": "alpine:3.22"}]
+        }))
+        .unwrap();
+        never.validate().unwrap();
+        let secrets = Secrets::new();
+        let inputs = Inputs {
+            files: Path::new("/var/lib/orqos/workload/files"),
+            secrets: &secrets,
+        };
+        let files = render("job", TOKEN, &never, &inputs);
+        let init = &files
+            .iter()
+            .find(|f| f.name == "orqos-job-c-wait.container")
+            .unwrap()
+            .content;
+        assert!(
+            init.contains("Type=oneshot\nRemainAfterExit=yes\nRestart=no\n"),
+            "{init}"
+        );
+        let main = &files
+            .iter()
+            .find(|f| f.name == "orqos-job-c-job.container")
+            .unwrap()
+            .content;
+        assert!(
+            main.contains("After=orqos-job-c-wait.service\nRequires=orqos-job-c-wait.service\n")
+        );
+        assert!(
+            !main.contains("ExecStartPre"),
+            "no sidecar startup probe, no gate"
         );
     }
 

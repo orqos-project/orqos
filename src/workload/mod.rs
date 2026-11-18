@@ -18,7 +18,8 @@ use utoipa::ToSchema;
 
 use files::Secrets;
 use spec::{
-    valid_id, valid_secret_name, valid_volume_name, Medium, PodSpec, SecretSpec, VolumeSpec,
+    valid_id, valid_secret_name, valid_volume_name, ContainerKind, Medium, PodSpec, SecretSpec,
+    VolumeSpec,
 };
 use store::{Desired, NetworkRecord, Record, SecretRecord, Store, VolumeRecord};
 use units::{Ownership, Paths};
@@ -81,6 +82,8 @@ pub struct UnitStatus {
 #[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct ContainerStatus {
     pub name: String,
+    /// `init` (`active` with sub-state `exited` once it succeeded), `sidecar` or `container`.
+    pub kind: ContainerKind,
     #[serde(flatten)]
     pub unit: UnitStatus,
     /// The startup probe has passed (or there is none and the container runs).
@@ -264,7 +267,7 @@ impl WorkloadState {
     /// Starts (or restarts) the pod's prober if any container has probes.
     fn start_prober(&self, id: &str, spec: &PodSpec) {
         self.stop_prober(id);
-        if !spec.containers.iter().any(probes::has_probes) {
+        if !spec.every_container().any(|(_, c)| probes::has_probes(c)) {
             return;
         }
         let token = tokio_util::sync::CancellationToken::new();
@@ -285,6 +288,7 @@ impl WorkloadState {
         if let Some(token) = self.probers.lock().expect("prober registry").remove(id) {
             token.cancel();
         }
+        probes::close_gate(id);
         self.probes.retain(|(pod, _), _| pod != id);
     }
 
@@ -317,7 +321,10 @@ impl WorkloadState {
     /// Refuses to act unless every existing unit and the Podman pod carry this record's token.
     async fn verify_owned(&self, record: &Record) -> Result<(), WorkloadError> {
         let dir = self.paths.units.join(&record.token);
-        for unit in units::units_of(&record.id, record.spec.containers.iter().map(|c| &c.name)) {
+        for unit in units::units_of(
+            &record.id,
+            record.spec.every_container().map(|(_, c)| &c.name),
+        ) {
             if let Ownership::Foreign(why) =
                 units::unit_ownership(&units::show(&unit).await?, &record.token, &dir)
             {
@@ -339,7 +346,7 @@ impl WorkloadState {
 
     /// A new pod must not collide with units or a Podman pod that already exist under its names.
     async fn verify_free(&self, id: &str, spec: &PodSpec) -> Result<(), WorkloadError> {
-        for unit in units::units_of(id, spec.containers.iter().map(|c| &c.name)) {
+        for unit in units::units_of(id, spec.every_container().map(|(_, c)| &c.name)) {
             if units::show(&unit)
                 .await?
                 .get("LoadState")
@@ -480,7 +487,7 @@ impl WorkloadState {
                     return Err(missing(&files.name, key));
                 }
             }
-            for c in &spec.containers {
+            for (_, c) in spec.every_container() {
                 for m in c.mounts.iter().filter(|m| m.volume == volume) {
                     let Some(sub) = m.sub_path.as_deref().map(|p| p.trim_end_matches('/')) else {
                         continue;
@@ -497,7 +504,7 @@ impl WorkloadState {
                 }
             }
         }
-        for c in &spec.containers {
+        for (_, c) in spec.every_container() {
             for (variable, r) in &c.secret_env {
                 let value = secrets[&r.secret]
                     .get(&r.key)
@@ -576,7 +583,7 @@ impl WorkloadState {
         let pod_unit = render::pod_unit(&record.id);
         let pod = unit_status(&pod_unit, &units::show(&pod_unit).await?);
         let mut containers = Vec::new();
-        for c in &record.spec.containers {
+        for (kind, c) in record.spec.every_container() {
             let unit = render::container_unit(&record.id, &c.name);
             let unit = unit_status(&unit, &units::show(&unit).await?);
             let active = unit.active_state == "active";
@@ -592,6 +599,7 @@ impl WorkloadState {
             };
             containers.push(ContainerStatus {
                 name: c.name.clone(),
+                kind,
                 unit,
                 started,
                 ready,
@@ -603,7 +611,12 @@ impl WorkloadState {
         Ok(PodStatus {
             id: record.id.clone(),
             desired: record.desired,
-            ready: state == "running" && containers.iter().all(|c| c.ready),
+            // Init containers have finished once the pod runs; readiness is the sidecars' and containers'.
+            ready: state == "running"
+                && containers
+                    .iter()
+                    .filter(|c| c.kind != ContainerKind::Init)
+                    .all(|c| c.ready),
             state: state.into(),
             pod,
             containers,
@@ -623,7 +636,7 @@ impl WorkloadState {
         units::systemctl("stop", &render::pod_unit(&record.id)).await?;
         units::reset_failed(&units::units_of(
             &record.id,
-            record.spec.containers.iter().map(|c| &c.name),
+            record.spec.every_container().map(|(_, c)| &c.name),
         ))
         .await;
         Ok(())
@@ -1080,6 +1093,7 @@ mod tests {
             .iter()
             .map(|(a, s)| ContainerStatus {
                 name: "c".into(),
+                kind: ContainerKind::Container,
                 unit: unit(a, s, "success"),
                 started: false,
                 ready: false,

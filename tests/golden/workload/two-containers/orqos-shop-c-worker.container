@@ -15,8 +15,8 @@ StopTimeout=40
 
 [Service]
 Restart=always
+TimeoutStartSec=600
 RestartSec=1s
 RestartSteps=8
 RestartMaxDelaySec=300s
-TimeoutStartSec=600
 TimeoutStopSec=70
