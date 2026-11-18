@@ -626,6 +626,92 @@ def resources(orqos):
     orqos.call("DELETE", "/workload/pods/rs")
 
 
+REGISTRY = "localhost:5000"
+REGISTRY_CONF = "/etc/containers/registries.conf.d/99-orqos-smoke.conf"
+PRIVATE = f"{REGISTRY}/smoke/private:1"
+
+
+def start_registry(workdir):
+    """A local registry with htpasswd auth on plain HTTP (allowed for localhost:5000 by a smoke-only drop-in)."""
+    os.makedirs(os.path.dirname(REGISTRY_CONF), exist_ok=True)
+    with open(REGISTRY_CONF, "w") as f:
+        f.write(f'[[registry]]\nlocation = "{REGISTRY}"\ninsecure = true\n')
+    auth_dir = os.path.join(workdir, "auth")
+    os.makedirs(auth_dir, exist_ok=True)
+    htpasswd = sh("podman", "run", "--rm", "--entrypoint", "htpasswd", "docker.io/library/httpd:2.4", "-Bbn",
+                  "smoke", "s3cret")
+    with open(os.path.join(auth_dir, "htpasswd"), "w") as f:
+        f.write(htpasswd + "\n")
+    sh("podman", "run", "-d", "--name", "orqos-smoke-registry", "-p", "127.0.0.1:5000:5000",
+       "-v", f"{auth_dir}:/auth", "-e", "REGISTRY_AUTH=htpasswd", "-e", "REGISTRY_AUTH_HTPASSWD_REALM=smoke",
+       "-e", "REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd", "docker.io/library/registry:2")
+    until("the registry", lambda: subprocess.run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                                                  f"http://{REGISTRY}/v2/"], capture_output=True,
+                                                 text=True).stdout == "401", seconds=60)
+    authfile = os.path.join(workdir, "push-auth.json")
+    sh("podman", "login", "--authfile", authfile, "-u", "smoke", "-p", "s3cret", REGISTRY)
+    sh("podman", "tag", IMAGE, PRIVATE)
+    sh("podman", "push", "--authfile", authfile, PRIVATE)
+    sh("podman", "rmi", PRIVATE)
+
+
+def docker_config(user, password):
+    token = base64.b64encode(f"{user}:{password}".encode()).decode()
+    return b64(json.dumps({"auths": {REGISTRY: {"auth": token}}}))
+
+
+def registry(orqos):
+    """Pulls use the pod's registry credentials and follow its pull policy; failures are reported at apply and
+    change nothing; digests pin images."""
+    workdir = "/tmp/orqos-smoke-registry"
+    start_registry(workdir)
+    for name, password in (("smoke-reg-bad", "wrong"), ("smoke-reg", "s3cret")):
+        code, body = orqos.call("PUT", f"/workload/secrets/{name}", {"data": {".dockerconfigjson": docker_config("smoke", password)}})
+        ok(code == 200, f"a pull secret is stored ({name})")
+    code, body = orqos.call("PUT", "/workload/secrets/smoke-reg-junk", {"data": {".dockerconfigjson": b64("{}")}})
+
+    def pod(image, secret, pull="missing"):
+        return {"hostname": "rg-0", "grace_seconds": 2, "image_pull_secrets": [secret] if secret else [],
+                "containers": [{"name": "app", "image": image, "pull": pull, "command": ["sleep", "infinity"]}]}
+
+    code, body = orqos.call("PUT", "/workload/pods/rg", pod(PRIVATE, "smoke-reg-junk"))
+    ok(code == 422 and "auths" in body["error"], f"a pull secret without auths is refused ({code} {body})")
+    code, body = orqos.call("PUT", "/workload/pods/rg", pod(PRIVATE, "smoke-reg-bad"))
+    ok(code == 502 and PRIVATE in body["error"] and "unauthorized" in body["error"].lower(),
+       f"a pull with wrong credentials is refused at apply, naming the image ({code} {body.get('error', '')[:200]})")
+    ok(orqos.call("GET", "/workload/pods/rg")[0] == 404, "a failed pull creates nothing")
+    code, body = orqos.call("PUT", "/workload/pods/rg", pod(PRIVATE, "smoke-reg", pull="always"))
+    ok(code == 200, f"with the right credentials the private image is pulled and runs ({code})")
+    status = wait_state(orqos, "rg", "running")
+    image_id = sh("podman", "image", "inspect", "--format", "{{.Id}}", PRIVATE)
+    ok(status["containers"][0]["image_id"] == image_id, f"status shows the image the container runs ({image_id[:12]})")
+    auth = os.path.join(FILES, "rg", "registry-auth.json")
+    ok(owner_mode(auth) == "0:0 600", f"the merged credentials are a root-only file ({owner_mode(auth)})")
+    digest = sh("podman", "image", "inspect", "--format", "{{.Digest}}", PRIVATE)
+    pinned = f"{REGISTRY}/smoke/private@{digest}"
+    code, body = orqos.call("PUT", "/workload/pods/rg", pod(pinned, "smoke-reg"))
+    ok(code == 200, f"an image pinned by digest runs ({code} {body.get('error') if isinstance(body, dict) else ''})")
+    wait_state(orqos, "rg", "running")
+    wrong = f"{REGISTRY}/smoke/private@sha256:{'0' * 64}"
+    code, body = orqos.call("PUT", "/workload/pods/rg", pod(wrong, "smoke-reg"))
+    ok(code == 502, f"a digest the registry does not have fails the pull ({code})")
+    ok(wait_state(orqos, "rg", "running")["spec"]["containers"][0]["image"] == pinned,
+       "and the running pod is left as it was")
+    orqos.call("DELETE", "/workload/pods/rg")
+    ok(not os.path.exists(auth), "removing the pod removes its credentials")
+    code, body = orqos.call("PUT", "/workload/pods/rn", pod(f"{REGISTRY}/smoke/absent:1", None, pull="never"))
+    ok(code == 422 and "pull policy never" in body["error"], f"never refuses an absent image ({code} {body})")
+    for name in ("smoke-reg-bad", "smoke-reg", "smoke-reg-junk"):
+        orqos.call("DELETE", f"/workload/secrets/{name}")
+
+
+def stop_registry():
+    subprocess.run(["podman", "rm", "--force", "--ignore", "orqos-smoke-registry"], capture_output=True)
+    subprocess.run(["podman", "rmi", "--force", PRIVATE], capture_output=True)
+    if os.path.exists(REGISTRY_CONF):
+        os.remove(REGISTRY_CONF)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--orqos", required=True, help="path to the orqos binary")
@@ -644,18 +730,20 @@ def main():
         probes(orqos)
         init_and_sidecars(orqos)
         resources(orqos)
+        registry(orqos)
         print("workload smoke: all checks passed")
     finally:
         try:
             if orqos.process.poll() is None:
-                for pod in ("smoke", "web0", "web1", "other", "nettaken", "st", "st2", "st-unknown", "sec", "pr", "pn", "is", "in", "rs"):
+                for pod in ("smoke", "web0", "web1", "other", "nettaken", "st", "st2", "st-unknown", "sec", "pr", "pn", "is", "in", "rs", "rg", "rn"):
                     orqos.call("DELETE", f"/workload/pods/{pod}")
                 orqos.call("DELETE", "/workload/volumes/smoke-data")
-                for name in ("smoke-tls", "smoke-db", "smoke-bad"):
+                for name in ("smoke-tls", "smoke-db", "smoke-bad", "smoke-reg", "smoke-reg-bad", "smoke-reg-junk"):
                     orqos.call("DELETE", f"/workload/secrets/{name}")
         except Exception:  # cleanup must continue
             pass
         orqos.stop()
+        stop_registry()
         for pod in (FOREIGN, "orqos-taken", "orqos-smoke"):
             subprocess.run(["podman", "pod", "rm", "--force", "--ignore", pod], capture_output=True)
         subprocess.run(["podman", "rm", "--force", "--ignore", "smoke-default-client"], capture_output=True)

@@ -93,6 +93,8 @@ pub struct ContainerStatus {
     /// Restarts caused by failing startup or liveness probes since Orqos started.
     pub probe_restarts: u32,
     pub last_probe_failure: Option<String>,
+    /// The image the container runs (Podman's image ID), when it exists.
+    pub image_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
@@ -456,6 +458,75 @@ impl WorkloadState {
         Ok(())
     }
 
+    /// Makes every image of the pod available before its units change, so a pull failure is reported at apply and
+    /// leaves the running pod alone: `missing` pulls absent images, `always` pulls, `never` requires the image.
+    /// Pulls use the pod's merged registry credentials from a temporary root-only auth file.
+    async fn prepare_images(
+        &self,
+        id: &str,
+        spec: &PodSpec,
+        secrets: &files::Secrets,
+    ) -> Result<(), WorkloadError> {
+        let root = self.files_root();
+        let auth = if spec.image_pull_secrets.is_empty() {
+            None
+        } else {
+            let path = root.join(format!(".{id}.pull-auth.json"));
+            files::write_private(&root, &path, &files::pull_auth(spec, secrets)?)?;
+            Some(path)
+        };
+        let result = async {
+            let mut seen = std::collections::BTreeSet::new();
+            for (_, c) in spec.every_container() {
+                let policy = c.pull.unwrap_or(spec::Pull::Missing);
+                if !seen.insert((c.image.as_str(), policy.as_str())) {
+                    continue;
+                }
+                let present = units::run(
+                    "podman",
+                    &["image", "exists", &c.image],
+                    &[],
+                    std::time::Duration::from_secs(30),
+                )
+                .await
+                .is_ok();
+                match policy {
+                    spec::Pull::Never if !present => {
+                        return Err(WorkloadError::Invalid(format!(
+                            "image {} is not present and container {:?} has pull policy never",
+                            c.image, c.name
+                        )))
+                    }
+                    spec::Pull::Never => {}
+                    spec::Pull::Missing if present => {}
+                    _ => {
+                        let mut args = vec!["pull", "--quiet"];
+                        let flag;
+                        if let Some(path) = &auth {
+                            flag = format!("--authfile={}", path.display());
+                            args.push(&flag);
+                        }
+                        args.push(&c.image);
+                        units::run("podman", &args, &[], std::time::Duration::from_secs(600))
+                            .await
+                            .map_err(|e| {
+                                WorkloadError::Backend(format!(
+                                    "pulling image {} for container {:?} failed: {e}",
+                                    c.image, c.name
+                                ))
+                            })?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        .await;
+        if let Some(path) = auth {
+            let _ = std::fs::remove_file(path);
+        }
+        result
+    }
+
     /// Where secret volumes are written.
     fn files_root(&self) -> std::path::PathBuf {
         self.paths.state.join("files")
@@ -503,6 +574,9 @@ impl WorkloadState {
                     }
                 }
             }
+        }
+        if !spec.image_pull_secrets.is_empty() {
+            files::pull_auth(spec, &secrets)?;
         }
         for (_, c) in spec.every_container() {
             for (variable, r) in &c.secret_env {
@@ -582,6 +656,26 @@ impl WorkloadState {
     async fn observe(&self, record: &Record) -> Result<PodStatus, WorkloadError> {
         let pod_unit = render::pod_unit(&record.id);
         let pod = unit_status(&pod_unit, &units::show(&pod_unit).await?);
+        // One listing per pod: container name → image ID.
+        let images: BTreeMap<String, String> = units::run(
+            "podman",
+            &[
+                "ps",
+                "--all",
+                "--filter",
+                &format!("label={}={}", render::POD_LABEL, record.id),
+                "--format",
+                "{{.Names}} {{.ImageID}}",
+            ],
+            &[],
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.split_once(' '))
+        .map(|(n, i)| (n.to_string(), i.to_string()))
+        .collect();
         let mut containers = Vec::new();
         for (kind, c) in record.spec.every_container() {
             let unit = render::container_unit(&record.id, &c.name);
@@ -598,6 +692,9 @@ impl WorkloadState {
                 (active, active)
             };
             containers.push(ContainerStatus {
+                image_id: images
+                    .get(&format!("{}-{}", render::pod_name(&record.id), c.name))
+                    .cloned(),
                 name: c.name.clone(),
                 kind,
                 unit,
@@ -649,6 +746,7 @@ impl WorkloadState {
         spec.validate().map_err(WorkloadError::Invalid)?;
         let _guard = self.lock.lock().await;
         let existing = self.store.load(id).map_err(storage)?;
+        let secrets = self.verify_secrets(&spec)?;
         let mut record = match existing {
             Some(record) => {
                 self.verify_owned(&record).await?;
@@ -659,6 +757,8 @@ impl WorkloadState {
                     }
                 }
                 if record.spec != spec {
+                    // Pull first: a failed pull leaves the running pod untouched.
+                    self.prepare_images(id, &spec, &secrets).await?;
                     self.stop_prober(id);
                     self.stop_units(&record).await?;
                     // A replaced pod starts with empty scratch volumes.
@@ -668,6 +768,7 @@ impl WorkloadState {
             }
             None => {
                 self.verify_free(id, &spec).await?;
+                self.prepare_images(id, &spec, &secrets).await?;
                 let now = chrono::Utc::now().to_rfc3339();
                 Record {
                     id: id.into(),
@@ -685,7 +786,6 @@ impl WorkloadState {
             record.spec.network.as_ref().map(|n| &n.name) != spec.network.as_ref().map(|n| &n.name);
         self.ensure_network(&spec).await?;
         self.verify_volumes(&spec).await?;
-        let secrets = self.verify_secrets(&spec)?;
         self.prepare_scratch(id, &record.token, &spec).await?;
         // The old units are stopped when the spec changed, so no container sees the files change.
         let root = self.files_root();
@@ -1095,6 +1195,7 @@ mod tests {
             .map(|(a, s)| ContainerStatus {
                 name: "c".into(),
                 kind: ContainerKind::Container,
+                image_id: None,
                 unit: unit(a, s, "success"),
                 started: false,
                 ready: false,

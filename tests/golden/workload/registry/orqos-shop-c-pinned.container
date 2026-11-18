@@ -1,0 +1,22 @@
+# Managed by Orqos for owner 0123456789abcdef0123456789abcdef. Do not edit: the next apply replaces this file.
+[Unit]
+Description=Orqos workload pod shop container pinned owner 0123456789abcdef0123456789abcdef
+StartLimitIntervalSec=0
+
+[Container]
+ContainerName=orqos-shop-pinned
+Pod=orqos-shop.pod
+Image=docker.io/library/alpine@sha256:4bcff63911fcb4448bd4fdacec207030997caf25e9bea4045fa6c8c44de311d1
+Pull=never
+PodmanArgs=--authfile=/var/lib/orqos/workload/files/shop/registry-auth.json
+Label=dev.orqos.owner=0123456789abcdef0123456789abcdef
+Label=dev.orqos.pod=shop
+StopTimeout=30
+
+[Service]
+Restart=always
+TimeoutStartSec=600
+RestartSec=1s
+RestartSteps=8
+RestartMaxDelaySec=300s
+TimeoutStopSec=60

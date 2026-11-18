@@ -5,9 +5,9 @@ generator. It is the execution layer for [Rezn](https://github.com/rezn-project/
 0001). This first version covers backend selection and host checks (#16), owned unit lifecycle (#17) and pods
 with a shared network namespace and hostname (#18), owned pod networks with DNS aliases (part of #25), container
 identity and hardening (#20), scratch volumes (#21), owned volumes (#22), secret files and environment
-variables (#24), startup, readiness and liveness probes (#26), init containers and sidecars (#19), and cgroup
-limits and requests. Image pulls, live network membership changes, fuller observation, usage accounting and reboot
-recovery follow in #23–#32.
+variables (#24), startup, readiness and liveness probes (#26), init containers and sidecars (#19), cgroup
+limits and requests, and image pulls with registry credentials and pull policies (#23). Live network membership
+changes, fuller observation, usage accounting and reboot recovery follow in #25–#32.
 
 ## Prerequisites
 
@@ -98,7 +98,9 @@ error), and **401** without the bearer token.
 | `hostname` | Hostname inside every container (DNS label). |
 | `init`, `sidecars` | Optional lists of containers (same fields as `containers`; at most 32 containers in all, names unique across the three lists), below. |
 | `containers[].name` | DNS label of at most 63 characters, unique in the pod. The container is named `orqos-<id>-<name>`. |
-| `containers[].image` | Image reference, pulled when missing. |
+| `containers[].image` | Image reference; `name@sha256:<digest>` pins it (Podman verifies the digest). |
+| `containers[].pull` | `missing` (default: pull only when absent), `always` (pull before every container start) or `never` (the image must already be present). |
+| `image_pull_secrets` | Up to 8 owned secrets with a `.dockerconfigjson` key (Docker's `{"auths": {...}}`), merged with the first winning per registry and used for every pull of the pod's images. |
 | `containers[].command` | Replaces the image's entrypoint and default command (Kubernetes `command`). |
 | `containers[].args` | Replaces the image's default command (Kubernetes `args`). Without `command`, empty and lone `;` arguments are rejected: set `command` to pass them. |
 | `containers[].env` | Variables passed literally (no `$` or `%` expansion). |
@@ -134,6 +136,16 @@ Every container is its own systemd unit in the pod, ordered by systemd:
   `ExecStartPre` gate until **every** such probe has passed: Orqos then creates
   `/run/orqos/workload/<id>/sidecars-started` (removed when the pod stops or is replaced).
 - Scratch volumes are pod-level, so init containers, sidecars and containers share them.
+
+### Image pulls
+
+Before a pod is created or replaced, Orqos makes its images available: `missing` pulls absent images, `always`
+pulls, `never` requires the image. A failed pull is refused (**502**, naming the image and Podman's error, such as
+`unauthorized`) and changes nothing, so a running pod being replaced keeps running; `never` with an absent image is
+a **422**. Pulls use the pod's merged credentials from a temporary root-only file; the containers' own pulls (`always`
+on every start) use `/var/lib/orqos/workload/files/<id>/registry-auth.json` (0600, root-only parents, removed with
+the pod) through `--authfile`, since Quadlet container units have no `AuthFile=` key. Each container reports the
+`image_id` it runs.
 
 ### Probes
 
@@ -220,5 +232,6 @@ the last operation `error`.
 `cargo test` covers spec validation, network bookkeeping, unit rendering (golden files in `tests/golden/workload/`, accepted by the
 Quadlet generator), ownership rules, backend selection and route mounting. `sudo python3
 scripts/workload_smoke.py --orqos target/debug/orqos` runs the live lifecycle against real systemd and Podman, including network
-aliases, isolation, volumes, secret files, probes, init containers and sidecars, resources, and cleanup; the
+aliases, isolation, volumes, secret files, probes, init containers and sidecars, resources, authenticated pulls
+from a local registry, and cleanup; the
 *Workload backend* workflow runs it on Ubuntu 26.04 for every push and pull request.
