@@ -589,6 +589,43 @@ def init_and_sidecars(orqos):
     orqos.call("DELETE", "/workload/pods/in")
 
 
+def resources(orqos):
+    """Limits and requests become the container's cgroup settings; a process past its memory limit is OOM-killed and
+    restarted; CPU limits above the host's CPUs are capped; capacity is reported."""
+    code, capacity = orqos.call("GET", "/workload/capacity")
+    ok(code == 200 and capacity["cpu_millis"] >= 1000 and capacity["memory_bytes"] > 1 << 28,
+       f"capacity reports the host's CPUs and memory ({capacity})")
+    hog = "trap 'exit 0' TERM; while true; do sleep 1; done"
+    spec = {"hostname": "rs-0", "grace_seconds": 2, "containers": [
+        {"name": "app", "image": IMAGE, "command": ["/bin/sh", "-c", hog],
+         "resources": {"cpu_limit_millis": 500, "cpu_request_millis": 250,
+                       "memory_limit_bytes": 64 << 20, "memory_request_bytes": 32 << 20}},
+        {"name": "wide", "image": IMAGE, "command": ["/bin/sh", "-c", hog],
+         "resources": {"cpu_limit_millis": capacity["cpu_millis"] + 4000}}]}
+    code, body = orqos.call("PUT", "/workload/pods/rs", spec)
+    ok(code == 200, f"apply creates a pod with resources ({code} {body.get('error') if isinstance(body, dict) else ''})")
+    wait_state(orqos, "rs", "running")
+    read = sh("podman", "exec", "orqos-rs-app", "sh", "-c",
+              "cd /sys/fs/cgroup && cat memory.max memory.swap.max memory.low cpu.max cpu.weight").splitlines()
+    ok(read[:4] == ["67108864", "0", "33554432", "50000 100000"],
+       f"limits and requests reach the cgroup: memory.max, memory.swap.max, memory.low, cpu.max ({read})")
+    ok(read[4] != "100", f"the CPU request sets cpu.weight ({read[4]})")
+    wide = sh("podman", "exec", "orqos-rs-wide", "cat", "/sys/fs/cgroup/cpu.max").split()
+    ok(int(wide[0]) // int(wide[1]) == capacity["cpu_millis"] // 1000,
+       f"a CPU limit above the host's CPUs is capped at them ({wide})")
+    def oom_kills():
+        events = sh("podman", "exec", "orqos-rs-app", "cat", "/sys/fs/cgroup/memory.events", check=False)
+        line = next((l for l in events.splitlines() if l.startswith("oom_kill ")), "oom_kill 0")
+        return int(line.split()[1])
+    # dd allocates its whole 100 MB block at once, past the 64 MiB limit.
+    hog = subprocess.run(["podman", "exec", "orqos-rs-app", "dd", "if=/dev/zero", "of=/dev/null", "bs=100M", "count=1"],
+                         capture_output=True, text=True)
+    until("the OOM kill", lambda: oom_kills() >= 1, seconds=30)
+    ok(hog.returncode != 0 and oom_kills() >= 1,
+       f"a process past the memory limit is OOM-killed (exit {hog.returncode}, oom_kill {oom_kills()})")
+    orqos.call("DELETE", "/workload/pods/rs")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--orqos", required=True, help="path to the orqos binary")
@@ -606,11 +643,12 @@ def main():
         secret_files(orqos)
         probes(orqos)
         init_and_sidecars(orqos)
+        resources(orqos)
         print("workload smoke: all checks passed")
     finally:
         try:
             if orqos.process.poll() is None:
-                for pod in ("smoke", "web0", "web1", "other", "nettaken", "st", "st2", "st-unknown", "sec", "pr", "pn", "is", "in"):
+                for pod in ("smoke", "web0", "web1", "other", "nettaken", "st", "st2", "st-unknown", "sec", "pr", "pn", "is", "in", "rs"):
                     orqos.call("DELETE", f"/workload/pods/{pod}")
                 orqos.call("DELETE", "/workload/volumes/smoke-data")
                 for name in ("smoke-tls", "smoke-db", "smoke-bad"):

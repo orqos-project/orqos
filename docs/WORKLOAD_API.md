@@ -5,8 +5,9 @@ generator. It is the execution layer for [Rezn](https://github.com/rezn-project/
 0001). This first version covers backend selection and host checks (#16), owned unit lifecycle (#17) and pods
 with a shared network namespace and hostname (#18), owned pod networks with DNS aliases (part of #25), container
 identity and hardening (#20), scratch volumes (#21), owned volumes (#22), secret files and environment
-variables (#24), startup, readiness and liveness probes (#26), and init containers and sidecars (#19). Image
-pulls, live network membership changes, fuller observation and reboot recovery follow in #23–#28.
+variables (#24), startup, readiness and liveness probes (#26), init containers and sidecars (#19), and cgroup
+limits and requests. Image pulls, live network membership changes, fuller observation, usage accounting and reboot
+recovery follow in #23–#32.
 
 ## Prerequisites
 
@@ -43,7 +44,8 @@ sudo ORQOS_BACKENDS=workload ORQOS_WORKLOAD_TOKEN="$(openssl rand -hex 32)" BIND
 
 | Method and path | Effect |
 | --- | --- |
-| `GET /workload/capabilities` | Host requirements and what was found; `problems` is empty when all are met. |
+| `GET /workload/capabilities` | Host requirements and what was found; `problems` is empty when all are met. Includes `capacity`. |
+| `GET /workload/capacity` | The host's `cpu_millis` (online CPUs × 1000) and `memory_bytes` (`MemTotal`), for clients' admission checks. |
 | `GET /workload/pods` | Every pod with its observed state. |
 | `PUT /workload/pods/{id}` | Apply a pod spec: create and start, start an unchanged stopped pod, or replace a changed pod in one go (stop, new units, start). Re-applying an unchanged running pod changes nothing. |
 | `GET /workload/pods/{id}` | One pod. |
@@ -106,6 +108,7 @@ error), and **401** without the bearer token.
 | `containers[].no_new_privileges` | `no-new-privileges`: setuid binaries and file capabilities grant nothing. |
 | `containers[].drop_all_capabilities` | Drops every capability. Podman's default seccomp profile always applies. |
 | `containers[].startup`, `.readiness`, `.liveness` | Optional probes, below. |
+| `containers[].resources` | Optional `cpu_limit_millis`, `cpu_request_millis`, `memory_limit_bytes`, `memory_request_bytes` (CPU 1–1000000, memory 6 MiB–1 TiB, requests at most limits), applied to the container's cgroup: a memory limit sets `memory.max` with no swap (`memory.swap.max=0`), a memory request `memory.low`, a CPU limit `cpu.max` (capped at the host's CPUs, which Podman requires), a CPU request the CPU weight (shares = millis × 1024 / 1000, at least 2). A process past its memory limit is OOM-killed and the restart policy applies. |
 | `containers[].mounts` | Up to 32 `{volume, path, read_only?, sub_path?}`: a pod volume at an absolute `path` (letters, digits, `/ . _ - + @`, no `..`), optionally a relative `sub_path` inside it. |
 | `supplementary_groups` | Up to 16 extra GIDs of every container (at most 65535). The first owns the pod's scratch volumes. |
 | `volumes` | Up to 32 `{name, volume}` (an owned volume, which must exist), `{name, secret: {name, items?, mode?, group?}}` (files from an owned secret, below) or `{name, scratch: {medium, bytes}}`. `memory` scratch is a tmpfs of `bytes`; `disk` scratch is a local volume (`bytes` advisory). Scratch volumes are empty when the pod is created or replaced, shared by its containers, kept across container restarts and removed with the pod. Their root is `root:<first supplementary group>` 2775, or 0777 without one. |
@@ -217,5 +220,5 @@ the last operation `error`.
 `cargo test` covers spec validation, network bookkeeping, unit rendering (golden files in `tests/golden/workload/`, accepted by the
 Quadlet generator), ownership rules, backend selection and route mounting. `sudo python3
 scripts/workload_smoke.py --orqos target/debug/orqos` runs the live lifecycle against real systemd and Podman, including network
-aliases, isolation, volumes, secret files, probes, init containers and sidecars, and cleanup; the
+aliases, isolation, volumes, secret files, probes, init containers and sidecars, resources, and cleanup; the
 *Workload backend* workflow runs it on Ubuntu 26.04 for every push and pull request.

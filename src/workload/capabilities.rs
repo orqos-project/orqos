@@ -24,8 +24,41 @@ pub struct Capabilities {
     pub subordinate_ids: bool,
     /// Podman uses netavark with aardvark-dns, which resolves pod network aliases.
     pub network_dns: bool,
+    /// What the host offers pods.
+    pub capacity: Capacity,
     /// Empty when every requirement is met.
     pub problems: Vec<String>,
+}
+
+/// The host's CPUs and memory (clients subtract their own reserve to decide what they may request).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, utoipa::ToSchema)]
+pub struct Capacity {
+    /// Online CPUs × 1000.
+    pub cpu_millis: u64,
+    /// `MemTotal`.
+    pub memory_bytes: u64,
+}
+
+/// `MemTotal` from `/proc/meminfo`, in bytes.
+pub fn parse_mem_total(meminfo: &str) -> Option<u64> {
+    let line = meminfo.lines().find(|l| l.starts_with("MemTotal:"))?;
+    let mut words = line.split_whitespace().skip(1);
+    let value: u64 = words.next()?.parse().ok()?;
+    match words.next() {
+        Some("kB") => value.checked_mul(1024),
+        None => Some(value),
+        _ => None,
+    }
+}
+
+pub fn capacity() -> Capacity {
+    Capacity {
+        cpu_millis: std::thread::available_parallelism().map_or(1, |n| n.get() as u64) * 1000,
+        memory_bytes: std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|m| parse_mem_total(&m))
+            .unwrap_or(0),
+    }
 }
 
 pub fn parse_systemd_version(text: &str) -> Option<u32> {
@@ -144,6 +177,7 @@ pub async fn check(paths: &Paths) -> Capabilities {
         );
     }
     Capabilities {
+        capacity: capacity(),
         network_dns,
         root,
         systemd_version,
@@ -158,6 +192,16 @@ pub async fn check(paths: &Paths) -> Capabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn meminfo_totals_are_bytes() {
+        assert_eq!(
+            parse_mem_total("MemTotal:       16303428 kB\nMemFree:  1 kB\n"),
+            Some(16303428 * 1024)
+        );
+        assert_eq!(parse_mem_total("MemFree: 1 kB\n"), None);
+        assert!(capacity().cpu_millis >= 1000);
+    }
 
     #[test]
     fn parses_versions() {

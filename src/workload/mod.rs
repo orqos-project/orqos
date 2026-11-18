@@ -698,6 +698,7 @@ impl WorkloadState {
             let inputs = render::Inputs {
                 files: &root,
                 secrets: &secrets,
+                cpu_millis: capabilities::capacity().cpu_millis,
             };
             let files = render::render(id, &record.token, &record.spec, &inputs);
             units::install(&self.paths, id, &record.token, &files).await?;

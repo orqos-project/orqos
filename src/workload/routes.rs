@@ -43,6 +43,7 @@ async fn authenticate(State(app): State<Arc<AppState>>, request: Request, next: 
 pub fn routes(app: Arc<AppState>) -> Router<Arc<AppState>> {
     Router::new()
         .route("/workload/capabilities", get(capabilities))
+        .route("/workload/capacity", get(capacity))
         .route("/workload/pods", get(list))
         .route(
             "/workload/pods/{id}",
@@ -220,4 +221,14 @@ pub async fn remove_secret(
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, WorkloadError> {
     Ok(Json(state(&app)?.remove_secret(&name).await?))
+}
+
+#[utoipa::path(get, path = "/workload/capacity", security(("workload_bearer" = [])),
+    responses((status = 200, description = "The host's CPUs (× 1000) and memory", body = super::capabilities::Capacity)),
+    tag = "Workload")]
+pub async fn capacity(
+    State(app): State<Arc<AppState>>,
+) -> Result<Json<super::capabilities::Capacity>, WorkloadError> {
+    state(&app)?;
+    Ok(Json(super::capabilities::capacity()))
 }
