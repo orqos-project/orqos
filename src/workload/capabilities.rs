@@ -1,5 +1,6 @@
 //! Host checks for the workload backend (orqos#16): root, systemd ≥ 254, cgroup v2, Podman ≥ 5.0 with its
-//! Quadlet system generator, and subordinate ID ranges for `UserNS=auto`.
+//! Quadlet system generator, subordinate ID ranges for `UserNS=auto`, and netavark with aardvark-dns for pod
+//! networks.
 use std::path::Path;
 use std::time::Duration;
 
@@ -21,6 +22,8 @@ pub struct Capabilities {
     pub quadlet: bool,
     /// `/etc/subuid` and `/etc/subgid` give the `containers` user ranges, which `UserNS=auto` allocates from.
     pub subordinate_ids: bool,
+    /// Podman uses netavark with aardvark-dns, which resolves pod network aliases.
+    pub network_dns: bool,
     /// Empty when every requirement is met.
     pub problems: Vec<String>,
 }
@@ -32,6 +35,18 @@ pub fn parse_systemd_version(text: &str) -> Option<u32> {
 pub fn parse_podman_version(text: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(text).ok()?;
     value["Client"]["Version"].as_str().map(str::to_string)
+}
+
+/// Whether `podman info --format json` reports the netavark backend with a DNS server (aardvark-dns).
+pub fn parse_network_dns(text: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return false;
+    };
+    let host = &value["host"];
+    host["networkBackend"] == "netavark"
+        && host["networkBackendInfo"]["dns"]["version"]
+            .as_str()
+            .is_some_and(|v| !v.is_empty())
 }
 
 pub fn version_at_least(version: &str, minimum: (u32, u32)) -> bool {
@@ -81,6 +96,9 @@ pub async fn check(paths: &Paths) -> Capabilities {
         .await
         .ok()
         .and_then(|t| parse_podman_version(&t));
+    let network_dns = run("podman", &["info", "--format", "json"], &[], short)
+        .await
+        .is_ok_and(|t| parse_network_dns(&t));
     let quadlet = paths.quadlet.exists() && Path::new(GENERATOR).exists();
     let read = |p: &str| std::fs::read_to_string(p).unwrap_or_default();
     let subordinate_ids = has_range(&read("/etc/subuid"), "containers")
@@ -119,7 +137,14 @@ pub async fn check(paths: &Paths) -> Capabilities {
                 .into(),
         );
     }
+    if !network_dns {
+        problems.push(
+            "Podman's netavark network backend with aardvark-dns is required for pod networks"
+                .into(),
+        );
+    }
     Capabilities {
+        network_dns,
         root,
         systemd_version,
         cgroup_v2,
@@ -147,6 +172,19 @@ mod tests {
         assert!(version_at_least("6.2.0", (5, 0)));
         assert!(!version_at_least("4.9.3", (5, 0)));
         assert!(!version_at_least("", (5, 0)));
+    }
+
+    #[test]
+    fn network_dns_needs_netavark_and_aardvark() {
+        let info = |backend: &str, dns: &str| {
+            format!(
+                r#"{{"host":{{"networkBackend":"{backend}","networkBackendInfo":{{"dns":{{"version":"{dns}"}}}}}}}}"#
+            )
+        };
+        assert!(parse_network_dns(&info("netavark", "aardvark-dns 1.16.0")));
+        assert!(!parse_network_dns(&info("netavark", "")));
+        assert!(!parse_network_dns(&info("cni", "aardvark-dns 1.16.0")));
+        assert!(!parse_network_dns("not json"));
     }
 
     #[test]

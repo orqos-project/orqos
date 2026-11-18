@@ -21,6 +21,22 @@ pub struct PodSpec {
     /// ownership). Keys are lowercase `[a-z0-9./-]`; the `dev.orqos.` prefix is reserved.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
+    /// An Orqos-owned Podman network to join instead of Podman's default network, with DNS aliases for the pod.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<NetworkSpec>,
+}
+
+/// Pods naming the same network share it and resolve each other's aliases (aardvark-dns). Orqos creates the
+/// network on first use and removes it when no pod names it any more.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkSpec {
+    /// DNS label of at most 40 characters; the Podman network is `orqos-net-<name>`.
+    pub name: String,
+    /// DNS names that resolve to this pod on the network, in the given order. Several pods may share an alias:
+    /// it then resolves to all of them.
+    #[serde(default)]
+    pub aliases: Vec<String>,
 }
 
 fn default_grace() -> u32 {
@@ -68,6 +84,16 @@ fn is_label(value: &str, max: usize) -> bool {
         && bytes
             .iter()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+}
+
+/// Network names become `orqos-net-<name>`; 40 characters keep that within Podman's limits with room to spare.
+pub fn valid_network_name(name: &str) -> bool {
+    is_label(name, 40)
+}
+
+/// A lowercase DNS name: dot-separated labels of at most 63 characters, at most 253 in total.
+fn valid_dns_name(name: &str) -> bool {
+    name.len() <= 253 && name.split('.').all(|label| is_label(label, 63))
 }
 
 fn valid_label_key(key: &str) -> bool {
@@ -138,6 +164,25 @@ impl PodSpec {
                 return Err(format!(
                     "labels.{key}: letters, digits and . _ : / @ + -, at most 256 characters"
                 ));
+            }
+        }
+        if let Some(network) = &self.network {
+            if !valid_network_name(&network.name) {
+                return Err("network.name: a DNS label of at most 40 characters".into());
+            }
+            if network.aliases.len() > 64 {
+                return Err("network.aliases: at most 64".into());
+            }
+            let mut seen = BTreeSet::new();
+            for (i, alias) in network.aliases.iter().enumerate() {
+                if !valid_dns_name(alias) {
+                    return Err(format!(
+                        "network.aliases[{i}]: a lowercase DNS name (dot-separated labels, at most 253 characters)"
+                    ));
+                }
+                if !seen.insert(alias.as_str()) {
+                    return Err(format!("network.aliases[{i}]: duplicate alias {alias:?}"));
+                }
             }
         }
         let mut names = BTreeSet::new();
@@ -254,6 +299,37 @@ mod tests {
         v["containers"][0]["name"] = json!("c".repeat(63));
         assert!(spec(v.clone()).is_ok());
         v["containers"][0]["name"] = json!("c".repeat(64));
+        assert!(spec(v).is_err());
+    }
+
+    #[test]
+    fn networks_are_checked() {
+        let mut v = minimal();
+        v["network"] = json!({"name": "rz-0123", "aliases": ["web", "web.shop.svc", "web-0.web"]});
+        assert_eq!(spec(v.clone()).unwrap().network.unwrap().aliases.len(), 3);
+        v["network"] = json!({"name": "rz-0123"});
+        assert!(spec(v.clone()).unwrap().network.unwrap().aliases.is_empty());
+        v["network"] = json!({"name": "n".repeat(41)});
+        assert!(spec(v.clone()).unwrap_err().starts_with("network.name"));
+        v["network"] = json!({"name": "Net"});
+        assert!(spec(v.clone()).unwrap_err().starts_with("network.name"));
+        for bad in [
+            "Web", "web..svc", ".web", "web.", "-web", "web_1", "a b", "",
+        ] {
+            v["network"] = json!({"name": "n", "aliases": [bad]});
+            assert!(
+                spec(v.clone())
+                    .unwrap_err()
+                    .starts_with("network.aliases[0]"),
+                "{bad:?}"
+            );
+        }
+        v["network"] = json!({"name": "n", "aliases": ["web", "web"]});
+        assert!(spec(v.clone()).unwrap_err().contains("duplicate"));
+        v["network"] =
+            json!({"name": "n", "aliases": (0..65).map(|i| format!("a{i}")).collect::<Vec<_>>()});
+        assert!(spec(v.clone()).unwrap_err().contains("at most 64"));
+        v["network"] = json!({"name": "n", "extra": 1});
         assert!(spec(v).is_err());
     }
 

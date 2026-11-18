@@ -15,7 +15,7 @@ use tokio::sync::Mutex;
 use utoipa::ToSchema;
 
 use spec::{valid_id, PodSpec};
-use store::{Desired, Record, Store};
+use store::{Desired, NetworkRecord, Record, Store};
 use units::{Ownership, Paths};
 
 #[derive(Debug)]
@@ -127,10 +127,38 @@ pub fn summarize(pod: &UnitStatus, containers: &[ContainerStatus]) -> &'static s
     }
 }
 
+/// An owned network and the pods that name it.
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct NetworkStatus {
+    pub name: String,
+    /// The Podman network, `orqos-net-<name>`.
+    pub podman_name: String,
+    /// Whether the Podman network currently exists (it is recreated on the next apply or start if not).
+    pub exists: bool,
+    pub pods: Vec<String>,
+    pub created_at: String,
+}
+
+/// Owned networks that no pod record names.
+pub fn unreferenced<'a>(networks: &'a [NetworkRecord], pods: &[Record]) -> Vec<&'a NetworkRecord> {
+    networks
+        .iter()
+        .filter(|n| {
+            !pods.iter().any(|p| {
+                p.spec
+                    .network
+                    .as_ref()
+                    .is_some_and(|net| net.name == n.name)
+            })
+        })
+        .collect()
+}
+
 pub struct WorkloadState {
     token: String,
     paths: Paths,
     store: Store,
+    networks: Store<NetworkRecord>,
     // Serializes every operation: unit files, systemd state and records change together.
     lock: Mutex<()>,
 }
@@ -146,10 +174,12 @@ impl WorkloadState {
             capabilities.problems.join("; ")
         );
         let store = Store::open(&paths.state)?;
+        let networks = Store::open(&paths.state.join("networks"))?;
         Ok(Self {
             token,
             paths,
             store,
+            networks,
             lock: Mutex::new(()),
         })
     }
@@ -194,7 +224,7 @@ impl WorkloadState {
             }
         }
         let labels = units::pod_labels(&render::pod_name(&record.id)).await?;
-        if let Ownership::Foreign(why) = units::pod_ownership(labels.as_ref(), &record.token) {
+        if let Ownership::Foreign(why) = units::label_ownership(labels.as_ref(), &record.token) {
             return Err(WorkloadError::Conflict(format!(
                 "Podman pod for {} is not owned by Orqos: {why}",
                 record.id
@@ -224,6 +254,69 @@ impl WorkloadState {
             )));
         }
         Ok(())
+    }
+
+    /// Makes the pod's network exist and verifies that Orqos owns it. A network name seen for the first time gets
+    /// a record and a token before the Podman network is created; an existing Podman network of that name that
+    /// Orqos has no record of is refused, never adopted. A recorded network that vanished is created again.
+    async fn ensure_network(&self, spec: &PodSpec) -> Result<(), WorkloadError> {
+        let Some(network) = &spec.network else {
+            return Ok(());
+        };
+        let podman = render::network_name(&network.name);
+        let labels = units::network_labels(&podman).await?;
+        let record = match self.networks.load(&network.name).map_err(storage)? {
+            Some(record) => record,
+            None => {
+                if labels.is_some() {
+                    return Err(WorkloadError::Conflict(format!(
+                        "a Podman network named {podman} already exists; refusing to adopt it"
+                    )));
+                }
+                let record = NetworkRecord {
+                    name: network.name.clone(),
+                    token: store::new_token(),
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                };
+                self.networks.save(&record).map_err(storage)?;
+                record
+            }
+        };
+        match units::label_ownership(labels.as_ref(), &record.token) {
+            Ownership::Owned => Ok(()),
+            Ownership::Absent => units::create_network(&record.name, &record.token).await,
+            Ownership::Foreign(why) => Err(WorkloadError::Conflict(format!(
+                "Podman network {podman} is not owned by Orqos: {why}"
+            ))),
+        }
+    }
+
+    /// Removes owned networks that no pod names any more. Problems are returned, not raised: the pod operation
+    /// that triggered the cleanup has already succeeded, and the periodic check retries.
+    async fn release_networks(&self) -> Vec<String> {
+        let (networks, pods) = match (self.networks.list(), self.store.list()) {
+            (Ok(networks), Ok(pods)) => (networks, pods),
+            (Err(e), _) | (_, Err(e)) => return vec![format!("workload state: {e:#}")],
+        };
+        let mut problems = Vec::new();
+        for network in unreferenced(&networks, &pods) {
+            let podman = render::network_name(&network.name);
+            let result = match units::network_labels(&podman).await {
+                Ok(labels) => match units::label_ownership(labels.as_ref(), &network.token) {
+                    Ownership::Owned => units::remove_network(&network.name).await,
+                    Ownership::Absent => Ok(()),
+                    Ownership::Foreign(why) => Err(WorkloadError::Conflict(format!(
+                        "Podman network {podman} is not owned by Orqos: {why}; keeping its record"
+                    ))),
+                },
+                Err(e) => Err(e),
+            };
+            match result.and_then(|()| self.networks.remove(&network.name).map_err(storage)) {
+                Ok(()) => {}
+                Err(e) => problems.push(format!("network {}: {e}", network.name)),
+            }
+        }
+        problems
     }
 
     async fn observe(&self, record: &Record) -> Result<PodStatus, WorkloadError> {
@@ -301,6 +394,9 @@ impl WorkloadState {
             }
         };
         let changed = record.spec != spec || !self.paths.units.join(&record.token).exists();
+        let left_network =
+            record.spec.network.as_ref().map(|n| &n.name) != spec.network.as_ref().map(|n| &n.name);
+        self.ensure_network(&spec).await?;
         record.spec = spec;
         record.desired = Desired::Running;
         if changed {
@@ -308,6 +404,11 @@ impl WorkloadState {
             units::install(&self.paths, id, &record.token, &files).await?;
         }
         self.save(&mut record, None)?;
+        if left_network {
+            for problem in self.release_networks().await {
+                tracing::warn!(%problem, "Releasing an unused workload network failed");
+            }
+        }
         if let Err(error) = units::systemctl("start", &render::pod_unit(id)).await {
             self.save(&mut record, Some(error.to_string()))?;
             return Err(error);
@@ -320,7 +421,10 @@ impl WorkloadState {
         let mut record = self.record(id)?;
         self.verify_owned(&record).await?;
         record.desired = Desired::Running;
-        let result = units::systemctl("start", &render::pod_unit(id)).await;
+        let result = match self.ensure_network(&record.spec).await {
+            Ok(()) => units::systemctl("start", &render::pod_unit(id)).await,
+            Err(e) => Err(e),
+        };
         self.save(&mut record, result.as_ref().err().map(ToString::to_string))?;
         result?;
         self.observe(&record).await
@@ -355,6 +459,11 @@ impl WorkloadState {
             .await?;
         }
         self.store.remove(id).map_err(storage)?;
+        if record.spec.network.is_some() {
+            for problem in self.release_networks().await {
+                tracing::warn!(%problem, "Releasing an unused workload network failed");
+            }
+        }
         Ok(serde_json::json!({"id": id, "status": "removed"}))
     }
 
@@ -371,6 +480,31 @@ impl WorkloadState {
         Ok(pods)
     }
 
+    pub async fn networks(&self) -> Result<Vec<NetworkStatus>, WorkloadError> {
+        let pods = self.store.list().map_err(storage)?;
+        let mut networks = Vec::new();
+        for record in self.networks.list().map_err(storage)? {
+            let podman_name = render::network_name(&record.name);
+            networks.push(NetworkStatus {
+                exists: units::network_labels(&podman_name).await?.is_some(),
+                podman_name,
+                pods: pods
+                    .iter()
+                    .filter(|p| {
+                        p.spec
+                            .network
+                            .as_ref()
+                            .is_some_and(|n| n.name == record.name)
+                    })
+                    .map(|p| p.id.clone())
+                    .collect(),
+                name: record.name,
+                created_at: record.created_at,
+            });
+        }
+        Ok(networks)
+    }
+
     /// Periodic check: pods that should run but whose units failed or vanished are reported.
     pub async fn reconcile(&self) -> Vec<String> {
         let mut problems = Vec::new();
@@ -385,6 +519,9 @@ impl WorkloadState {
                 Err(e) => problems.push(format!("{}: {e}", record.id)),
             }
         }
+        // Networks left behind by an interrupted removal.
+        let _guard = self.lock.lock().await;
+        problems.extend(self.release_networks().await);
         problems
     }
 }
@@ -450,6 +587,42 @@ mod tests {
             "failed"
         );
         assert_eq!(summarize(&unit("inactive", "dead", ""), &[]), "stopped");
+    }
+
+    #[test]
+    fn networks_nobody_names_are_unreferenced() {
+        let network = |name: &str| NetworkRecord {
+            name: name.into(),
+            token: store::new_token(),
+            created_at: String::new(),
+        };
+        let pod = |id: &str, network: Option<&str>| Record {
+            id: id.into(),
+            token: store::new_token(),
+            spec: serde_json::from_value(serde_json::json!({
+                "hostname": id,
+                "containers": [{"name": "c", "image": "alpine"}],
+                "network": network.map(|n| serde_json::json!({"name": n})),
+            }))
+            .unwrap(),
+            desired: Desired::Running,
+            error: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let networks = [network("a"), network("b"), network("c")];
+        let pods = [
+            pod("p", Some("a")),
+            pod("q", Some("a")),
+            pod("r", None),
+            pod("s", Some("c")),
+        ];
+        let names: Vec<&str> = unreferenced(&networks, &pods)
+            .iter()
+            .map(|n| n.name.as_str())
+            .collect();
+        assert_eq!(names, ["b"]);
+        assert_eq!(unreferenced(&networks, &[]).len(), 3);
     }
 
     #[test]

@@ -9,6 +9,7 @@ use super::spec::{ContainerSpec, PodSpec, Restart};
 
 pub const OWNER_LABEL: &str = "dev.orqos.owner";
 pub const POD_LABEL: &str = "dev.orqos.pod";
+pub const NETWORK_LABEL: &str = "dev.orqos.network";
 
 /// One rendered file: a name inside the pod's unit directory and its content.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,6 +20,11 @@ pub struct File {
 
 pub fn pod_name(id: &str) -> String {
     format!("orqos-{id}")
+}
+
+/// The Podman network of a network spec name.
+pub fn network_name(name: &str) -> String {
+    format!("orqos-net-{name}")
 }
 
 /// The systemd service Quadlet generates for the pod.
@@ -60,6 +66,18 @@ fn client_labels(spec: &PodSpec) -> String {
         .collect()
 }
 
+/// `Network=` and `NetworkAlias=` lines (aliases are validated DNS names, which need no quoting).
+fn network(spec: &PodSpec) -> String {
+    let Some(network) = &spec.network else {
+        return String::new();
+    };
+    let mut lines = format!("Network={}\n", network_name(&network.name));
+    for alias in &network.aliases {
+        lines.push_str(&format!("NetworkAlias={alias}\n"));
+    }
+    lines
+}
+
 fn header(token: &str) -> String {
     format!(
         "# Managed by Orqos for owner {token}. Do not edit: the next apply replaces this file.\n"
@@ -94,13 +112,14 @@ pub fn render(id: &str, token: &str, spec: &PodSpec) -> Vec<File> {
 fn render_pod(id: &str, token: &str, spec: &PodSpec) -> String {
     format!(
         "{header}[Unit]\nDescription={description}\nStartLimitIntervalSec=0\n\n\
-         [Pod]\nPodName={pod}\nHostName={hostname}\nUserNS=auto\n\
+         [Pod]\nPodName={pod}\nHostName={hostname}\nUserNS=auto\n{network}\
          Label={OWNER_LABEL}={token}\nLabel={POD_LABEL}={id}\n{labels}ExitPolicy=continue\nStopTimeout={grace}\n\n\
          [Service]\nTimeoutStopSec={stop}\n",
         header = header(token),
         description = description(id, token, None),
         pod = pod_name(id),
         hostname = spec.hostname,
+        network = network(spec),
         labels = client_labels(spec),
         grace = spec.grace_seconds,
         stop = spec.grace_seconds + 30,
@@ -219,6 +238,18 @@ mod tests {
                      "args": ["echo \"$1\" 100%", "sh", "", ";", "back\\slash"]},
                     {"name": "bare", "image": "alpine:3.22", "args": ["a b", "quote\"d", "$X", "50%"]}
                 ]
+            }),
+        );
+    }
+
+    #[test]
+    fn renders_a_pod_on_a_network() {
+        golden(
+            "network",
+            serde_json::json!({
+                "hostname": "db-0",
+                "network": {"name": "rz-0123456789abcdef01234567", "aliases": ["db", "db.shop", "db.shop.svc", "db-0.db", "db-0.db.shop", "db-0.db.shop.svc"]},
+                "containers": [{"name": "db", "image": "docker.io/library/postgres:17-alpine"}]
             }),
         );
     }

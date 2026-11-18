@@ -131,9 +131,13 @@ pub fn unit_ownership(show: &BTreeMap<String, String>, token: &str, dir: &Path) 
     }
 }
 
-/// Labels of a Podman pod, or `None` when no pod of that name exists.
-pub async fn pod_labels(name: &str) -> Result<Option<BTreeMap<String, String>>, WorkloadError> {
-    let exists = run("podman", &["pod", "exists", name], &[], SHORT)
+/// Labels of a Podman object (`pod` or `network`), or `None` when none of that name exists.
+async fn labels_of(
+    object: &str,
+    name: &str,
+    field: &str,
+) -> Result<Option<BTreeMap<String, String>>, WorkloadError> {
+    let exists = run("podman", &[object, "exists", name], &[], SHORT)
         .await
         .is_ok();
     if !exists {
@@ -141,16 +145,16 @@ pub async fn pod_labels(name: &str) -> Result<Option<BTreeMap<String, String>>, 
     }
     let text = run(
         "podman",
-        &["pod", "inspect", name, "--format", "json"],
+        &[object, "inspect", name, "--format", "json"],
         &[],
         SHORT,
     )
     .await?;
     let value: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| WorkloadError::Backend(format!("podman pod inspect: {e}")))?;
-    let pod = if value.is_array() { &value[0] } else { &value };
+        .map_err(|e| WorkloadError::Backend(format!("podman {object} inspect: {e}")))?;
+    let item = if value.is_array() { &value[0] } else { &value };
     Ok(Some(
-        pod["Labels"]
+        item[field]
             .as_object()
             .map(|labels| {
                 labels
@@ -162,7 +166,46 @@ pub async fn pod_labels(name: &str) -> Result<Option<BTreeMap<String, String>>, 
     ))
 }
 
-pub fn pod_ownership(labels: Option<&BTreeMap<String, String>>, token: &str) -> Ownership {
+/// Labels of a Podman pod, or `None` when no pod of that name exists.
+pub async fn pod_labels(name: &str) -> Result<Option<BTreeMap<String, String>>, WorkloadError> {
+    labels_of("pod", name, "Labels").await
+}
+
+/// Labels of a Podman network, or `None` when no network of that name exists.
+pub async fn network_labels(name: &str) -> Result<Option<BTreeMap<String, String>>, WorkloadError> {
+    labels_of("network", name, "labels").await
+}
+
+/// Creates an owned bridge network; Podman enables aardvark-dns on it, so its pods resolve each other's aliases.
+pub async fn create_network(name: &str, token: &str) -> Result<(), WorkloadError> {
+    let podman = render::network_name(name);
+    let owner = format!("{OWNER_LABEL}={token}");
+    let network = format!("{}={name}", render::NETWORK_LABEL);
+    run(
+        "podman",
+        &[
+            "network", "create", "--label", &owner, "--label", &network, &podman,
+        ],
+        &[],
+        SHORT,
+    )
+    .await
+    .map(|_| ())
+}
+
+pub async fn remove_network(name: &str) -> Result<(), WorkloadError> {
+    run(
+        "podman",
+        &["network", "rm", &render::network_name(name)],
+        &[],
+        SHORT,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// A Podman object belongs to its record when its owner label holds the record's token.
+pub fn label_ownership(labels: Option<&BTreeMap<String, String>>, token: &str) -> Ownership {
     match labels {
         None => Ownership::Absent,
         Some(labels) if labels.get(OWNER_LABEL).map(String::as_str) == Some(token) => {
@@ -369,13 +412,13 @@ mod tests {
     #[test]
     fn pods_are_owned_by_their_label() {
         let mut labels = BTreeMap::new();
-        assert_eq!(pod_ownership(None, TOKEN), Ownership::Absent);
+        assert_eq!(label_ownership(None, TOKEN), Ownership::Absent);
         assert!(matches!(
-            pod_ownership(Some(&labels), TOKEN),
+            label_ownership(Some(&labels), TOKEN),
             Ownership::Foreign(_)
         ));
         labels.insert(OWNER_LABEL.to_string(), TOKEN.to_string());
-        assert_eq!(pod_ownership(Some(&labels), TOKEN), Ownership::Owned);
+        assert_eq!(label_ownership(Some(&labels), TOKEN), Ownership::Owned);
     }
 
     #[test]
