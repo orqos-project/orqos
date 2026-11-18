@@ -219,6 +219,18 @@ def networks(orqos):
        "a pod reaches another by alias over the network")
     ok(resolve("orqos-other-server", "web") is None and resolve("orqos-other-server", "web-0.web") is None,
        "a pod on another network cannot resolve them")
+    web0_ip = next(iter(web0))
+    reach = subprocess.run(["podman", "exec", "orqos-other-server", "timeout", "5", "nc", web0_ip, "8080"],
+                           capture_output=True, text=True)
+    ok(reach.stdout.strip() != "web-0", f"a pod on another network cannot reach them by IP either ({web0_ip})")
+    sh("podman", "run", "-d", "--name", "smoke-default-client", IMAGE, "sleep", "300")
+    reach = subprocess.run(["podman", "exec", "smoke-default-client", "timeout", "5", "nc", web0_ip, "8080"],
+                           capture_output=True, text=True)
+    ok(reach.stdout.strip() != "web-0", "a container on Podman's default network cannot reach them by IP")
+    sh("podman", "rm", "-f", "-t", "0", "smoke-default-client")
+    options = json.loads(sh("podman", "network", "inspect", "orqos-net-smoke", "--format", "json"))
+    options = (options[0] if isinstance(options, list) else options).get("options", {})
+    ok(options.get("isolate") == "strict", f"owned networks are created strictly isolated ({options})")
 
     code, listed = orqos.call("GET", "/workload/networks")
     smoke = next((n for n in listed if n["name"] == "smoke"), None) if code == 200 else None
@@ -261,6 +273,7 @@ def main():
         orqos.stop()
         for pod in (FOREIGN, "orqos-taken", "orqos-smoke"):
             subprocess.run(["podman", "pod", "rm", "--force", "--ignore", pod], capture_output=True)
+        subprocess.run(["podman", "rm", "--force", "--ignore", "smoke-default-client"], capture_output=True)
         for network in ("orqos-net-taken", "orqos-net-smoke", "orqos-net-smoke-other"):
             subprocess.run(["podman", "network", "rm", "--force", network], capture_output=True)
 

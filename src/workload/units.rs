@@ -177,6 +177,9 @@ pub async fn network_labels(name: &str) -> Result<Option<BTreeMap<String, String
 }
 
 /// Creates an owned bridge network; Podman enables aardvark-dns on it, so its pods resolve each other's aliases.
+/// `isolate=strict` makes netavark drop traffic between it and every other bridge network (isolated or not, the
+/// default network included); without it, separate networks scope only DNS and still route to each other by IP.
+/// Egress to the outside keeps working.
 pub async fn create_network(name: &str, token: &str) -> Result<(), WorkloadError> {
     let podman = render::network_name(name);
     let owner = format!("{OWNER_LABEL}={token}");
@@ -184,7 +187,15 @@ pub async fn create_network(name: &str, token: &str) -> Result<(), WorkloadError
     run(
         "podman",
         &[
-            "network", "create", "--label", &owner, "--label", &network, &podman,
+            "network",
+            "create",
+            "--opt",
+            "isolate=strict",
+            "--label",
+            &owner,
+            "--label",
+            &network,
+            &podman,
         ],
         &[],
         SHORT,
