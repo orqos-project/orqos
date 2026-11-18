@@ -29,6 +29,7 @@ use crate::routes::shared::stats_ws::stats_ws;
     modifiers(&ControlSecurity),
     paths(
         crate::workload::routes::capabilities,
+        crate::workload::routes::capacity,
         crate::workload::routes::list,
         crate::workload::routes::inspect,
         crate::workload::routes::apply,

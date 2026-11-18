@@ -372,6 +372,61 @@ pub struct ContainerSpec {
     /// Reaching its failure threshold restarts the container (under the pod's restart policy).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub liveness: Option<Probe>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<Resources>,
+}
+
+/// Cgroup limits and requests of one container (cgroup v2, through Podman). Limits are hard; requests set the
+/// container's CPU weight and memory protection.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Resources {
+    /// `cpu.max`, capped at the host's CPUs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_limit_millis: Option<u64>,
+    /// `cpu.weight`, from Kubernetes' shares (millis × 1024 / 1000, at least 2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_request_millis: Option<u64>,
+    /// `memory.max`, with no swap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_limit_bytes: Option<u64>,
+    /// `memory.low`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_request_bytes: Option<u64>,
+}
+
+/// Podman refuses memory limits under 6 MiB.
+pub const MIN_MEMORY: u64 = 6 << 20;
+
+impl Resources {
+    fn validate(&self, at: &str) -> Result<(), String> {
+        for (field, value) in [
+            ("cpu_limit_millis", self.cpu_limit_millis),
+            ("cpu_request_millis", self.cpu_request_millis),
+        ] {
+            if value.is_some_and(|v| !(1..=1_000_000).contains(&v)) {
+                return Err(format!("{at}.{field}: 1 to 1000000"));
+            }
+        }
+        for (field, value) in [
+            ("memory_limit_bytes", self.memory_limit_bytes),
+            ("memory_request_bytes", self.memory_request_bytes),
+        ] {
+            if value.is_some_and(|v| !(MIN_MEMORY..=1 << 40).contains(&v)) {
+                return Err(format!("{at}.{field}: 6 MiB to 1 TiB"));
+            }
+        }
+        let above = |request: Option<u64>, limit: Option<u64>| matches!((request, limit), (Some(r), Some(l)) if r > l);
+        if above(self.cpu_request_millis, self.cpu_limit_millis) {
+            return Err(format!("{at}.cpu_request_millis: at most cpu_limit_millis"));
+        }
+        if above(self.memory_request_bytes, self.memory_limit_bytes) {
+            return Err(format!(
+                "{at}.memory_request_bytes: at most memory_limit_bytes"
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// A probe Orqos runs every `period_seconds`: `exec` inside the container, or an HTTP(S) `GET` from outside it,
@@ -745,6 +800,9 @@ impl PodSpec {
                     probe.validate(&format!("{at}.{kind}"))?;
                 }
             }
+            if let Some(resources) = &c.resources {
+                resources.validate(&format!("{at}.resources"))?;
+            }
             if c.env.len() + c.secret_env.len() > 256 {
                 return Err(format!("{at}: at most 256 environment variables"));
             }
@@ -1082,6 +1140,41 @@ mod tests {
         assert!(
             !spec(plain).unwrap().gated(),
             "only a sidecar startup probe gates"
+        );
+    }
+
+    #[test]
+    fn resources_are_checked() {
+        let mut v = minimal();
+        v["containers"][0]["resources"] = json!({"cpu_limit_millis": 500, "cpu_request_millis": 250,
+            "memory_limit_bytes": 67108864, "memory_request_bytes": 33554432});
+        assert!(spec(v.clone()).is_ok());
+        let broken = |pointer: &str, value: serde_json::Value| {
+            let mut b = v.clone();
+            *b.pointer_mut(pointer).unwrap() = value;
+            spec(b).unwrap_err()
+        };
+        assert!(
+            broken("/containers/0/resources/cpu_limit_millis", json!(0)).contains("1 to 1000000")
+        );
+        assert!(
+            broken("/containers/0/resources/memory_limit_bytes", json!(1024)).contains("6 MiB")
+        );
+        assert!(
+            broken("/containers/0/resources/cpu_request_millis", json!(600))
+                .contains("at most cpu_limit_millis")
+        );
+        assert!(broken(
+            "/containers/0/resources/memory_request_bytes",
+            json!(134217728)
+        )
+        .contains("at most memory_limit_bytes"));
+        assert!(broken("/containers/0/resources", json!({"gpus": 1})).contains("unknown field"));
+        let mut only_requests = minimal();
+        only_requests["containers"][0]["resources"] = json!({"cpu_request_millis": 100});
+        assert!(
+            spec(only_requests).is_ok(),
+            "a request without a limit is fine"
         );
     }
 

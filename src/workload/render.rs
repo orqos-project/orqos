@@ -8,13 +8,44 @@
 use std::path::Path;
 
 use super::files::{self, Secrets};
-use super::spec::{ContainerKind, ContainerSpec, Medium, PodSpec, Restart};
+use super::spec::{ContainerKind, ContainerSpec, Medium, PodSpec, Resources, Restart};
 
 /// What rendering needs beyond the spec: the root of secret files and the values of the secrets the pod uses
 /// (verified to exist, and to be UTF-8 without control characters where they become environment variables).
 pub struct Inputs<'a> {
     pub files: &'a Path,
     pub secrets: &'a Secrets,
+    /// The host's CPUs × 1000: Podman refuses a CPU limit above them, so limits are capped there.
+    pub cpu_millis: u64,
+}
+
+/// Quadlet lines for a container's cgroup settings. Without swap, as in Kubernetes; CPU requests become shares
+/// (millis × 1024 / 1000, at least 2, which cgroup v2 turns into `cpu.weight`).
+pub fn resource_lines(r: &Resources, host_cpu_millis: u64) -> String {
+    let mut lines = String::new();
+    if let Some(bytes) = r.memory_limit_bytes {
+        lines.push_str(&format!(
+            "Memory={bytes}\nPodmanArgs=--memory-swap={bytes}\n"
+        ));
+    }
+    if let Some(bytes) = r.memory_request_bytes {
+        lines.push_str(&format!("PodmanArgs=--memory-reservation={bytes}\n"));
+    }
+    if let Some(millis) = r.cpu_limit_millis {
+        let millis = millis.min(host_cpu_millis.max(1));
+        lines.push_str(&format!(
+            "PodmanArgs=--cpus={}.{:03}\n",
+            millis / 1000,
+            millis % 1000
+        ));
+    }
+    if let Some(millis) = r.cpu_request_millis {
+        lines.push_str(&format!(
+            "PodmanArgs=--cpu-shares={}\n",
+            (millis * 1024 / 1000).max(2)
+        ));
+    }
+    lines
 }
 
 pub const OWNER_LABEL: &str = "dev.orqos.owner";
@@ -153,7 +184,7 @@ pub fn render(id: &str, token: &str, spec: &PodSpec, inputs: &Inputs) -> Vec<Fil
         }
         files.push(File {
             name: format!("{base}.container"),
-            content: render_container(id, token, spec, kind, container, &base, inputs.files),
+            content: render_container(id, token, spec, kind, container, &base, inputs),
         });
     }
     files
@@ -192,7 +223,7 @@ fn render_container(
     kind: ContainerKind,
     c: &ContainerSpec,
     base: &str,
-    files_root: &Path,
+    inputs: &Inputs,
 ) -> String {
     let mut container = format!(
         "[Container]\nContainerName={pod}-{name}\nPod={pod}.pod\nImage={image}\n",
@@ -232,6 +263,9 @@ fn render_container(
     if c.drop_all_capabilities {
         container.push_str("DropCapability=all\n");
     }
+    if let Some(resources) = &c.resources {
+        container.push_str(&resource_lines(resources, inputs.cpu_millis));
+    }
     for m in &c.mounts {
         let volume = spec
             .volumes
@@ -240,7 +274,7 @@ fn render_container(
             .expect("validated: mounts name pod volumes");
         if volume.secret.is_some() {
             // Root-owned files, read-only; idmapped so their IDs inside match those on disk.
-            let source = files::source(files_root, id, &volume.name, m.sub_path.as_deref());
+            let source = files::source(inputs.files, id, &volume.name, m.sub_path.as_deref());
             container.push_str(&format!(
                 "Mount=type=bind,source={},destination={},ro,idmap\n",
                 source.display(),
@@ -369,6 +403,7 @@ mod tests {
         let inputs = Inputs {
             files: Path::new("/var/lib/orqos/workload/files"),
             secrets: &secrets,
+            cpu_millis: 4000,
         };
         let files = render("shop", TOKEN, &spec, &inputs);
         if std::env::var_os("UPDATE_GOLDEN").is_some() {
@@ -522,6 +557,7 @@ mod tests {
         let inputs = Inputs {
             files: Path::new("/var/lib/orqos/workload/files"),
             secrets: &secrets,
+            cpu_millis: 4000,
         };
         let files = render("job", TOKEN, &never, &inputs);
         let init = &files
@@ -545,6 +581,30 @@ mod tests {
             !main.contains("ExecStartPre"),
             "no sidecar startup probe, no gate"
         );
+    }
+
+    #[test]
+    fn resources_become_cgroup_settings() {
+        golden(
+            "resources",
+            serde_json::json!({
+                "hostname": "api-0",
+                "containers": [{"name": "api", "image": "alpine:3.22", "resources": {
+                    "cpu_limit_millis": 1500, "cpu_request_millis": 250,
+                    "memory_limit_bytes": 67108864, "memory_request_bytes": 33554432}}]
+            }),
+        );
+        let r = Resources {
+            cpu_limit_millis: Some(8000),
+            cpu_request_millis: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(
+            resource_lines(&r, 2000),
+            "PodmanArgs=--cpus=2.000\nPodmanArgs=--cpu-shares=2\n",
+            "limits above the host's CPUs are capped; shares are at least 2"
+        );
+        assert_eq!(resource_lines(&Resources::default(), 2000), "");
     }
 
     #[test]
