@@ -14,8 +14,8 @@ use serde::Serialize;
 use tokio::sync::Mutex;
 use utoipa::ToSchema;
 
-use spec::{valid_id, PodSpec};
-use store::{Desired, NetworkRecord, Record, Store};
+use spec::{valid_id, valid_volume_name, Medium, PodSpec, VolumeSpec};
+use store::{Desired, NetworkRecord, Record, Store, VolumeRecord};
 use units::{Ownership, Paths};
 
 #[derive(Debug)]
@@ -139,6 +139,27 @@ pub struct NetworkStatus {
     pub created_at: String,
 }
 
+/// An owned volume, its spec and the pods that mount it.
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct VolumeStatus {
+    pub name: String,
+    /// The Podman volume, `orqos-vol-<name>`.
+    pub podman_name: String,
+    pub exists: bool,
+    pub spec: VolumeSpec,
+    pub pods: Vec<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// IDs of the pods whose records mount an owned volume.
+pub fn mounting<'a>(volume: &str, pods: &'a [Record]) -> Vec<&'a str> {
+    pods.iter()
+        .filter(|p| p.spec.owned_volumes().any(|v| v == volume))
+        .map(|p| p.id.as_str())
+        .collect()
+}
+
 /// Owned networks that no pod record names.
 pub fn unreferenced<'a>(networks: &'a [NetworkRecord], pods: &[Record]) -> Vec<&'a NetworkRecord> {
     networks
@@ -159,6 +180,7 @@ pub struct WorkloadState {
     paths: Paths,
     store: Store,
     networks: Store<NetworkRecord>,
+    volumes: Store<VolumeRecord>,
     // Serializes every operation: unit files, systemd state and records change together.
     lock: Mutex<()>,
 }
@@ -175,11 +197,13 @@ impl WorkloadState {
         );
         let store = Store::open(&paths.state)?;
         let networks = Store::open(&paths.state.join("networks"))?;
+        let volumes = Store::open(&paths.state.join("volumes"))?;
         Ok(Self {
             token,
             paths,
             store,
             networks,
+            volumes,
             lock: Mutex::new(()),
         })
     }
@@ -319,6 +343,91 @@ impl WorkloadState {
         problems
     }
 
+    /// Every owned volume the spec mounts must be recorded, present and carry its record's token.
+    async fn verify_volumes(&self, spec: &PodSpec) -> Result<(), WorkloadError> {
+        for name in spec.owned_volumes() {
+            let record = self.volumes.load(name).map_err(storage)?.ok_or_else(|| {
+                WorkloadError::Invalid(format!(
+                    "unknown volume {name:?}: create it with PUT /workload/volumes/{name} first"
+                ))
+            })?;
+            let podman = render::volume_name(name);
+            match units::label_ownership(units::volume_labels(&podman).await?.as_ref(), &record.token) {
+                Ownership::Owned => {}
+                Ownership::Absent => {
+                    return Err(WorkloadError::Conflict(format!(
+                        "Podman volume {podman} has vanished; delete volume {name:?} and create it again"
+                    )))
+                }
+                Ownership::Foreign(why) => {
+                    return Err(WorkloadError::Conflict(format!(
+                        "Podman volume {podman} is not owned by Orqos: {why}"
+                    )))
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Creates the pod's missing scratch volumes, owned by the pod's token. A scratch volume of that name owned
+    /// by anything else is refused.
+    async fn prepare_scratch(
+        &self,
+        id: &str,
+        token: &str,
+        spec: &PodSpec,
+    ) -> Result<(), WorkloadError> {
+        let group = spec.supplementary_groups.first().copied();
+        for (name, scratch) in spec.scratch() {
+            let podman = render::scratch_name(id, name);
+            match units::label_ownership(units::volume_labels(&podman).await?.as_ref(), token) {
+                Ownership::Owned => continue,
+                Ownership::Foreign(why) => {
+                    return Err(WorkloadError::Conflict(format!(
+                        "Podman volume {podman} is not owned by pod {id}: {why}"
+                    )))
+                }
+                Ownership::Absent => {}
+            }
+            let gid = group.unwrap_or(0);
+            match scratch.medium {
+                Medium::Memory => {
+                    let mode = if group.is_some() { "2775" } else { "0777" };
+                    let options = [
+                        "type=tmpfs".to_string(),
+                        "device=tmpfs".to_string(),
+                        format!("o=size={},mode={mode},uid=0,gid={gid}", scratch.bytes),
+                    ];
+                    units::create_volume(&podman, token, (render::POD_LABEL, id), &options).await?;
+                }
+                Medium::Disk => {
+                    let options = [format!("o=uid=0,gid={gid}")];
+                    units::create_volume(&podman, token, (render::POD_LABEL, id), &options).await?;
+                    units::set_volume_root(&podman, group, 0o777).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Removes the pod's scratch volumes (only those carrying its token), so a replaced pod starts empty.
+    async fn remove_scratch(
+        &self,
+        id: &str,
+        token: &str,
+        spec: &PodSpec,
+    ) -> Result<(), WorkloadError> {
+        for (name, _) in spec.scratch() {
+            let podman = render::scratch_name(id, name);
+            if units::label_ownership(units::volume_labels(&podman).await?.as_ref(), token)
+                == Ownership::Owned
+            {
+                units::remove_volume(&podman).await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn observe(&self, record: &Record) -> Result<PodStatus, WorkloadError> {
         let pod_unit = render::pod_unit(&record.id);
         let pod = unit_status(&pod_unit, &units::show(&pod_unit).await?);
@@ -376,6 +485,8 @@ impl WorkloadState {
                 }
                 if record.spec != spec {
                     self.stop_units(&record).await?;
+                    // A replaced pod starts with empty scratch volumes.
+                    self.remove_scratch(id, &record.token, &record.spec).await?;
                 }
                 record
             }
@@ -397,6 +508,8 @@ impl WorkloadState {
         let left_network =
             record.spec.network.as_ref().map(|n| &n.name) != spec.network.as_ref().map(|n| &n.name);
         self.ensure_network(&spec).await?;
+        self.verify_volumes(&spec).await?;
+        self.prepare_scratch(id, &record.token, &spec).await?;
         record.spec = spec;
         record.desired = Desired::Running;
         if changed {
@@ -421,10 +534,14 @@ impl WorkloadState {
         let mut record = self.record(id)?;
         self.verify_owned(&record).await?;
         record.desired = Desired::Running;
-        let result = match self.ensure_network(&record.spec).await {
-            Ok(()) => units::systemctl("start", &render::pod_unit(id)).await,
-            Err(e) => Err(e),
-        };
+        let result = async {
+            self.ensure_network(&record.spec).await?;
+            self.verify_volumes(&record.spec).await?;
+            self.prepare_scratch(id, &record.token, &record.spec)
+                .await?;
+            units::systemctl("start", &render::pod_unit(id)).await
+        }
+        .await;
         self.save(&mut record, result.as_ref().err().map(ToString::to_string))?;
         result?;
         self.observe(&record).await
@@ -458,6 +575,7 @@ impl WorkloadState {
             )
             .await?;
         }
+        self.remove_scratch(id, &record.token, &record.spec).await?;
         self.store.remove(id).map_err(storage)?;
         if record.spec.network.is_some() {
             for problem in self.release_networks().await {
@@ -478,6 +596,143 @@ impl WorkloadState {
             pods.push(self.observe(&record).await?);
         }
         Ok(pods)
+    }
+
+    fn volume_status(&self, record: VolumeRecord, pods: &[Record], exists: bool) -> VolumeStatus {
+        VolumeStatus {
+            podman_name: render::volume_name(&record.name),
+            exists,
+            pods: mounting(&record.name, pods)
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            name: record.name,
+            spec: record.spec,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+        }
+    }
+
+    fn check_volume_name(name: &str) -> Result<(), WorkloadError> {
+        if valid_volume_name(name) {
+            Ok(())
+        } else {
+            Err(WorkloadError::Invalid(
+                "volume name: a DNS label of at most 48 characters".into(),
+            ))
+        }
+    }
+
+    /// Creates an owned volume or updates its spec. A new volume's root gets the group (mode 2775) or stays
+    /// `root:root` 0755; later, the root's group is set again only when it differs (never recursively). An
+    /// existing Podman volume without a record is refused, and a recorded one that vanished is reported, not
+    /// silently recreated empty.
+    pub async fn apply_volume(
+        &self,
+        name: &str,
+        spec: VolumeSpec,
+    ) -> Result<VolumeStatus, WorkloadError> {
+        Self::check_volume_name(name)?;
+        spec.validate().map_err(WorkloadError::Invalid)?;
+        let _guard = self.lock.lock().await;
+        let podman = render::volume_name(name);
+        let labels = units::volume_labels(&podman).await?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let record = match self.volumes.load(name).map_err(storage)? {
+            Some(mut record) => {
+                match units::label_ownership(labels.as_ref(), &record.token) {
+                    Ownership::Owned => {}
+                    Ownership::Absent => {
+                        return Err(WorkloadError::Conflict(format!(
+                            "Podman volume {podman} has vanished; delete volume {name:?} and create it again"
+                        )))
+                    }
+                    Ownership::Foreign(why) => {
+                        return Err(WorkloadError::Conflict(format!(
+                            "Podman volume {podman} is not owned by Orqos: {why}"
+                        )))
+                    }
+                }
+                if units::volume_root_group(&podman).await? != spec.group.unwrap_or(0) {
+                    units::set_volume_root(&podman, spec.group, 0o755).await?;
+                }
+                if record.spec != spec {
+                    record.spec = spec;
+                    record.updated_at = now;
+                    self.volumes.save(&record).map_err(storage)?;
+                }
+                record
+            }
+            None => {
+                if labels.is_some() {
+                    return Err(WorkloadError::Conflict(format!(
+                        "a Podman volume named {podman} already exists; refusing to adopt it"
+                    )));
+                }
+                let record = VolumeRecord {
+                    name: name.into(),
+                    token: store::new_token(),
+                    spec,
+                    created_at: now.clone(),
+                    updated_at: now,
+                };
+                self.volumes.save(&record).map_err(storage)?;
+                let options = [format!("o=uid=0,gid={}", record.spec.group.unwrap_or(0))];
+                units::create_volume(
+                    &podman,
+                    &record.token,
+                    (render::VOLUME_LABEL, name),
+                    &options,
+                )
+                .await?;
+                units::set_volume_root(&podman, record.spec.group, 0o755).await?;
+                record
+            }
+        };
+        let pods = self.store.list().map_err(storage)?;
+        Ok(self.volume_status(record, &pods, true))
+    }
+
+    pub async fn volumes(&self) -> Result<Vec<VolumeStatus>, WorkloadError> {
+        let pods = self.store.list().map_err(storage)?;
+        let mut volumes = Vec::new();
+        for record in self.volumes.list().map_err(storage)? {
+            let exists = units::volume_labels(&render::volume_name(&record.name))
+                .await?
+                .is_some();
+            volumes.push(self.volume_status(record, &pods, exists));
+        }
+        Ok(volumes)
+    }
+
+    /// Deletes an owned volume and its data. Refused while any pod mounts it.
+    pub async fn remove_volume(&self, name: &str) -> Result<serde_json::Value, WorkloadError> {
+        Self::check_volume_name(name)?;
+        let _guard = self.lock.lock().await;
+        let record = self
+            .volumes
+            .load(name)
+            .map_err(storage)?
+            .ok_or_else(|| WorkloadError::NotFound(format!("no volume {name:?}")))?;
+        let pods = self.store.list().map_err(storage)?;
+        let users = mounting(name, &pods);
+        if !users.is_empty() {
+            return Err(WorkloadError::Conflict(format!(
+                "volume {name:?} is mounted by pods {users:?}"
+            )));
+        }
+        let podman = render::volume_name(name);
+        match units::label_ownership(units::volume_labels(&podman).await?.as_ref(), &record.token) {
+            Ownership::Owned => units::remove_volume(&podman).await?,
+            Ownership::Absent => {}
+            Ownership::Foreign(why) => {
+                return Err(WorkloadError::Conflict(format!(
+                    "Podman volume {podman} is not owned by Orqos: {why}"
+                )))
+            }
+        }
+        self.volumes.remove(name).map_err(storage)?;
+        Ok(serde_json::json!({"name": name, "status": "removed"}))
     }
 
     pub async fn networks(&self) -> Result<Vec<NetworkStatus>, WorkloadError> {
@@ -623,6 +878,36 @@ mod tests {
             .collect();
         assert_eq!(names, ["b"]);
         assert_eq!(unreferenced(&networks, &[]).len(), 3);
+    }
+
+    #[test]
+    fn volumes_know_the_pods_that_mount_them() {
+        let pod = |id: &str, volumes: serde_json::Value| Record {
+            id: id.into(),
+            token: store::new_token(),
+            spec: serde_json::from_value(serde_json::json!({
+                "hostname": id, "volumes": volumes,
+                "containers": [{"name": "c", "image": "alpine"}],
+            }))
+            .unwrap(),
+            desired: Desired::Running,
+            error: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let pods = [
+            pod("a", serde_json::json!([{"name": "d", "volume": "data"}])),
+            pod(
+                "b",
+                serde_json::json!([{"name": "d", "volume": "data"}, {"name": "s", "scratch": {"medium": "disk", "bytes": 1}}]),
+            ),
+            pod(
+                "c",
+                serde_json::json!([{"name": "data", "scratch": {"medium": "memory", "bytes": 1}}]),
+            ),
+        ];
+        assert_eq!(mounting("data", &pods), ["a", "b"]);
+        assert!(mounting("other", &pods).is_empty());
     }
 
     #[test]

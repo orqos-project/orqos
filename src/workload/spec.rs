@@ -24,6 +24,94 @@ pub struct PodSpec {
     /// An Orqos-owned Podman network to join instead of Podman's default network, with DNS aliases for the pod.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<NetworkSpec>,
+    /// Extra group IDs of every container (`GroupAdd=`). The first also owns the pod's scratch volumes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supplementary_groups: Vec<u32>,
+    /// Volumes the pod's containers can mount.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<PodVolume>,
+}
+
+/// A pod volume: exactly one of `volume` (an owned volume, `PUT /workload/volumes/{name}`) or `scratch`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PodVolume {
+    /// DNS label, unique in the pod; mounts refer to it.
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scratch: Option<Scratch>,
+}
+
+/// Empty when the pod is created or replaced, shared by its containers, removed with the pod.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Scratch {
+    pub medium: Medium,
+    /// Size limit: enforced for `memory` (tmpfs), advisory for `disk`.
+    pub bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Medium {
+    Disk,
+    Memory,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MountSpec {
+    /// A pod volume name.
+    pub volume: String,
+    /// Absolute path in the container.
+    pub path: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
+    /// Relative path inside the volume to mount instead of its root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub_path: Option<String>,
+}
+
+/// The spec of an owned volume (`PUT /workload/volumes/{name}`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct VolumeSpec {
+    /// Group owning the volume's root directory (mode 2775, setgid); without it the root is `root:root` 0755.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<u32>,
+    /// The client's own labels, kept in Orqos's record (updatable), never on the Podman volume.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
+}
+
+/// User, group and supplementary IDs must fall inside the pod's 65536-ID user namespace.
+pub const MAX_ID: u32 = 65535;
+
+impl VolumeSpec {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.group.is_some_and(|g| g > MAX_ID) {
+            return Err(format!("group: at most {MAX_ID}"));
+        }
+        validate_labels(&self.labels)
+    }
+}
+
+/// Owned volume names become `orqos-vol-<name>`.
+pub fn valid_volume_name(name: &str) -> bool {
+    is_label(name, 48)
+}
+
+/// Paths travel through Quadlet's comma-separated `Mount=`: a conservative character set, no `..` components.
+fn valid_path(path: &str, absolute: bool) -> bool {
+    path.len() <= 1024
+        && path.starts_with('/') == absolute
+        && !path.is_empty()
+        && path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/._-+@".contains(&b))
+        && !path.split('/').any(|c| c == "..")
 }
 
 /// Pods naming the same network share it and resolve each other's aliases (aardvark-dns). Orqos creates the
@@ -68,6 +156,20 @@ pub struct ContainerSpec {
     /// Environment variables, passed literally.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
+    /// UID to run as (inside the pod's user namespace); the image's user when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<u32>,
+    /// Primary GID; needs `user`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<u32>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only_root: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_new_privileges: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub drop_all_capabilities: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mounts: Vec<MountSpec>,
 }
 
 /// Pod IDs become unit, pod and container names, so they are shorter than DNS labels (as in host mode).
@@ -137,7 +239,38 @@ fn valid_env_key(key: &str) -> bool {
         && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
+fn validate_labels(labels: &BTreeMap<String, String>) -> Result<(), String> {
+    if labels.len() > 32 {
+        return Err("labels: at most 32".into());
+    }
+    for (key, value) in labels {
+        if !valid_label_key(key) {
+            return Err(format!(
+                "labels: invalid key {key:?} (lowercase letters, digits, '.', '/' and '-', at most 128; \"dev.orqos.\" is reserved)"
+            ));
+        }
+        if !valid_label_value(value) {
+            return Err(format!(
+                "labels.{key}: letters, digits and . _ : / @ + -, at most 256 characters"
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl PodSpec {
+    /// Names of the owned volumes the pod mounts.
+    pub fn owned_volumes(&self) -> impl Iterator<Item = &str> {
+        self.volumes.iter().filter_map(|v| v.volume.as_deref())
+    }
+
+    /// The pod's scratch volumes.
+    pub fn scratch(&self) -> impl Iterator<Item = (&str, &Scratch)> {
+        self.volumes
+            .iter()
+            .filter_map(|v| Some((v.name.as_str(), v.scratch.as_ref()?)))
+    }
+
     /// Checks the spec, returning the first problem with its field path.
     pub fn validate(&self) -> Result<(), String> {
         if !is_label(&self.hostname, 63) {
@@ -151,19 +284,33 @@ impl PodSpec {
         if self.grace_seconds > 3600 {
             return Err("grace_seconds: at most 3600".into());
         }
-        if self.labels.len() > 32 {
-            return Err("labels: at most 32".into());
+        validate_labels(&self.labels)?;
+        if self.supplementary_groups.len() > 16 {
+            return Err("supplementary_groups: at most 16".into());
         }
-        for (key, value) in &self.labels {
-            if !valid_label_key(key) {
-                return Err(format!(
-                    "labels: invalid key {key:?} (lowercase letters, digits, '.', '/' and '-', at most 128; \"dev.orqos.\" is reserved)"
-                ));
+        if self.supplementary_groups.iter().any(|g| *g > MAX_ID) {
+            return Err(format!("supplementary_groups: IDs at most {MAX_ID}"));
+        }
+        if self.volumes.len() > 32 {
+            return Err("volumes: at most 32".into());
+        }
+        let mut volumes = BTreeSet::new();
+        for (i, v) in self.volumes.iter().enumerate() {
+            let at = format!("volumes[{i}]");
+            if !is_label(&v.name, 63) {
+                return Err(format!("{at}.name: a DNS label of at most 63 characters"));
             }
-            if !valid_label_value(value) {
-                return Err(format!(
-                    "labels.{key}: letters, digits and . _ : / @ + -, at most 256 characters"
-                ));
+            if !volumes.insert(v.name.as_str()) {
+                return Err(format!("{at}.name: duplicate volume name {:?}", v.name));
+            }
+            match (&v.volume, &v.scratch) {
+                (Some(name), None) if valid_volume_name(name) => {}
+                (Some(_), None) => {
+                    return Err(format!("{at}.volume: a DNS label of at most 48 characters"))
+                }
+                (None, Some(scratch)) if scratch.bytes > 0 => {}
+                (None, Some(_)) => return Err(format!("{at}.scratch.bytes: at least 1")),
+                _ => return Err(format!("{at}: exactly one of volume or scratch")),
             }
         }
         if let Some(network) = &self.network {
@@ -218,6 +365,35 @@ impl PodSpec {
                 if c.command.is_none() && args.iter().any(|a| a.is_empty() || a == ";") {
                     return Err(format!(
                         "{at}.args: empty or \";\" arguments need `command` (e.g. the image's entrypoint) to be set"
+                    ));
+                }
+            }
+            if c.user.is_some_and(|u| u > MAX_ID) || c.group.is_some_and(|g| g > MAX_ID) {
+                return Err(format!("{at}: user and group IDs at most {MAX_ID}"));
+            }
+            if c.group.is_some() && c.user.is_none() {
+                return Err(format!("{at}.group: needs user"));
+            }
+            if c.mounts.len() > 32 {
+                return Err(format!("{at}.mounts: at most 32"));
+            }
+            let mut paths = BTreeSet::new();
+            for (k, m) in c.mounts.iter().enumerate() {
+                let here = format!("{at}.mounts[{k}]");
+                if !volumes.contains(m.volume.as_str()) {
+                    return Err(format!("{here}.volume: no pod volume {:?}", m.volume));
+                }
+                if !valid_path(&m.path, true) || m.path == "/" {
+                    return Err(format!(
+                        "{here}.path: an absolute path of letters, digits and / . _ - + @, without '..'"
+                    ));
+                }
+                if !paths.insert(m.path.trim_end_matches('/')) {
+                    return Err(format!("{here}.path: mounted twice"));
+                }
+                if m.sub_path.as_deref().is_some_and(|p| !valid_path(p, false)) {
+                    return Err(format!(
+                        "{here}.sub_path: a relative path of letters, digits and / . _ - + @, without '..'"
                     ));
                 }
             }
@@ -331,6 +507,74 @@ mod tests {
         assert!(spec(v.clone()).unwrap_err().contains("at most 64"));
         v["network"] = json!({"name": "n", "extra": 1});
         assert!(spec(v).is_err());
+    }
+
+    #[test]
+    fn identity_volumes_and_mounts_are_checked() {
+        let mut v = minimal();
+        v["supplementary_groups"] = json!([2000]);
+        v["volumes"] = json!([
+            {"name": "state", "volume": "rz-0123"},
+            {"name": "tmp", "scratch": {"medium": "memory", "bytes": 1048576}}
+        ]);
+        v["containers"][0]["user"] = json!(1000);
+        v["containers"][0]["group"] = json!(1000);
+        v["containers"][0]["read_only_root"] = json!(true);
+        v["containers"][0]["no_new_privileges"] = json!(true);
+        v["containers"][0]["drop_all_capabilities"] = json!(true);
+        v["containers"][0]["mounts"] = json!([
+            {"volume": "state", "path": "/var/lib/app", "sub_path": "data/v1"},
+            {"volume": "tmp", "path": "/tmp", "read_only": false},
+            {"volume": "state", "path": "/etc/app", "read_only": true}
+        ]);
+        let ok = spec(v.clone()).unwrap();
+        assert_eq!(ok.owned_volumes().collect::<Vec<_>>(), ["rz-0123"]);
+        assert_eq!(ok.scratch().count(), 1);
+
+        let broken = |path: &str, value: serde_json::Value| {
+            let mut b = v.clone();
+            let mut target = &mut b;
+            for key in path.split('.') {
+                target = match key.parse::<usize>() {
+                    Ok(i) => &mut target[i],
+                    Err(_) => &mut target[key],
+                };
+            }
+            *target = value;
+            spec(b).unwrap_err()
+        };
+        assert!(broken("containers.0.mounts.0.volume", json!("nope")).contains("no pod volume"));
+        assert!(broken("containers.0.mounts.0.path", json!("relative")).contains(".path"));
+        assert!(broken("containers.0.mounts.0.path", json!("/a/../b")).contains(".path"));
+        assert!(broken("containers.0.mounts.0.path", json!("/a,b")).contains(".path"));
+        assert!(broken("containers.0.mounts.0.path", json!("/tmp")).contains("mounted twice"));
+        assert!(broken("containers.0.mounts.0.sub_path", json!("/abs")).contains("sub_path"));
+        assert!(broken("containers.0.mounts.0.sub_path", json!("a/../../b")).contains("sub_path"));
+        assert!(broken("containers.0.user", json!(65536)).contains("at most 65535"));
+        assert!(broken("supplementary_groups", json!([70000])).contains("at most 65535"));
+        assert!(broken("volumes.1.scratch.bytes", json!(0)).contains("at least 1"));
+        assert!(broken("volumes.1", json!({"name": "tmp"})).contains("exactly one"));
+        assert!(broken("volumes.1", json!({"name": "state", "volume": "x"})).contains("duplicate"));
+        assert!(broken("volumes.0.volume", json!("Bad")).contains("48"));
+        let mut g = v.clone();
+        g["containers"][0].as_object_mut().unwrap().remove("user");
+        assert!(spec(g).unwrap_err().contains("needs user"));
+    }
+
+    #[test]
+    fn volume_specs_are_checked() {
+        let ok: VolumeSpec =
+            serde_json::from_value(json!({"group": 2000, "labels": {"dev.rezn.retain": "true"}}))
+                .unwrap();
+        assert!(ok.validate().is_ok());
+        let big: VolumeSpec = serde_json::from_value(json!({"group": 65536})).unwrap();
+        assert!(big.validate().is_err());
+        let reserved: VolumeSpec =
+            serde_json::from_value(json!({"labels": {"dev.orqos.x": "1"}})).unwrap();
+        assert!(reserved.validate().unwrap_err().contains("reserved"));
+        assert!(serde_json::from_value::<VolumeSpec>(json!({"size": 1})).is_err());
+        assert!(valid_volume_name("rz-0123456789abcdef01234567"));
+        assert!(!valid_volume_name(&"a".repeat(49)));
     }
 
     #[test]

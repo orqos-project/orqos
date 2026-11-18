@@ -176,6 +176,73 @@ pub async fn network_labels(name: &str) -> Result<Option<BTreeMap<String, String
     labels_of("network", name, "labels").await
 }
 
+/// Labels of a Podman volume, or `None` when no volume of that name exists.
+pub async fn volume_labels(name: &str) -> Result<Option<BTreeMap<String, String>>, WorkloadError> {
+    labels_of("volume", name, "Labels").await
+}
+
+/// Creates a Podman volume with the given owner token, one more label and driver options. Ownership options
+/// (`o=uid=…,gid=…`) also stop Podman from chowning an empty volume to the first container's user.
+pub async fn create_volume(
+    name: &str,
+    token: &str,
+    label: (&str, &str),
+    options: &[String],
+) -> Result<(), WorkloadError> {
+    let owner = format!("{OWNER_LABEL}={token}");
+    let extra = format!("{}={}", label.0, label.1);
+    let mut args = vec!["volume", "create", "--label", &owner, "--label", &extra];
+    for option in options {
+        args.extend(["--opt", option]);
+    }
+    args.push(name);
+    run("podman", &args, &[], SHORT).await.map(|_| ())
+}
+
+pub async fn remove_volume(name: &str) -> Result<(), WorkloadError> {
+    run("podman", &["volume", "rm", name], &[], SHORT)
+        .await
+        .map(|_| ())
+}
+
+/// Sets a local volume's root directory to `root:<group>` with mode 2775 (setgid, so new files inherit the
+/// group), or to `root:root` with `mode_without_group`. Never recursive.
+pub async fn set_volume_root(
+    name: &str,
+    group: Option<u32>,
+    mode_without_group: u32,
+) -> Result<(), WorkloadError> {
+    let root = run(
+        "podman",
+        &["volume", "inspect", name, "--format", "{{.Mountpoint}}"],
+        &[],
+        SHORT,
+    )
+    .await?;
+    let root = Path::new(root.trim());
+    std::os::unix::fs::chown(root, Some(0), Some(group.unwrap_or(0))).map_err(io("chown", root))?;
+    let mode = if group.is_some() {
+        0o2775
+    } else {
+        mode_without_group
+    };
+    fs::set_permissions(root, fs::Permissions::from_mode(mode)).map_err(io("chmod", root))
+}
+
+/// The group of a local volume's root directory.
+pub async fn volume_root_group(name: &str) -> Result<u32, WorkloadError> {
+    let root = run(
+        "podman",
+        &["volume", "inspect", name, "--format", "{{.Mountpoint}}"],
+        &[],
+        SHORT,
+    )
+    .await?;
+    let root = Path::new(root.trim());
+    use std::os::unix::fs::MetadataExt;
+    Ok(fs::metadata(root).map_err(io("stat", root))?.gid())
+}
+
 /// Creates an owned bridge network; Podman enables aardvark-dns on it, so its pods resolve each other's aliases.
 /// `isolate=strict` makes netavark drop traffic between it and every other bridge network (isolated or not, the
 /// default network included); without it, separate networks scope only DNS and still route to each other by IP.

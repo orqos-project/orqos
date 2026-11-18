@@ -6,7 +6,7 @@ StartLimitIntervalSec=0
 [Pod]
 PodName=orqos-shop
 HostName=q
-UserNS=auto
+UserNS=auto:size=65536
 Label=dev.orqos.owner=0123456789abcdef0123456789abcdef
 Label=dev.orqos.pod=shop
 Label=app.example/tier=batch

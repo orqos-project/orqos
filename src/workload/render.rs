@@ -5,11 +5,15 @@
 //! JSON `Entrypoint=`, which carries any argument intact; bare `args` use systemd command-line quoting (empty and
 //! lone ";" arguments are rejected by validation); environment values go through `EnvironmentFile=`, which
 //! Podman reads literally. `%` and `$` are escaped wherever systemd would expand them.
-use super::spec::{ContainerSpec, PodSpec, Restart};
+use super::spec::{ContainerSpec, Medium, PodSpec, Restart};
 
 pub const OWNER_LABEL: &str = "dev.orqos.owner";
 pub const POD_LABEL: &str = "dev.orqos.pod";
 pub const NETWORK_LABEL: &str = "dev.orqos.network";
+pub const VOLUME_LABEL: &str = "dev.orqos.volume";
+
+/// Every pod gets its own range of 65536 IDs, so user, group and supplementary IDs up to 65535 are mapped.
+pub const USERNS: &str = "auto:size=65536";
 
 /// One rendered file: a name inside the pod's unit directory and its content.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +29,22 @@ pub fn pod_name(id: &str) -> String {
 /// The Podman network of a network spec name.
 pub fn network_name(name: &str) -> String {
     format!("orqos-net-{name}")
+}
+
+/// The Podman volume of an owned volume.
+pub fn volume_name(name: &str) -> String {
+    format!("orqos-vol-{name}")
+}
+
+/// The Podman volume backing one scratch volume of a pod.
+pub fn scratch_name(id: &str, volume: &str) -> String {
+    format!("orqos-{id}-scratch-{volume}")
+}
+
+/// Where a memory scratch volume is also mounted at pod level, so the infra container keeps the tmpfs (and its
+/// contents) for the pod's lifetime even while no other container runs.
+fn scratch_hold(volume: &str) -> String {
+    format!("/run/orqos-scratch/{volume}")
 }
 
 /// The systemd service Quadlet generates for the pod.
@@ -112,7 +132,7 @@ pub fn render(id: &str, token: &str, spec: &PodSpec) -> Vec<File> {
 fn render_pod(id: &str, token: &str, spec: &PodSpec) -> String {
     format!(
         "{header}[Unit]\nDescription={description}\nStartLimitIntervalSec=0\n\n\
-         [Pod]\nPodName={pod}\nHostName={hostname}\nUserNS=auto\n{network}\
+         [Pod]\nPodName={pod}\nHostName={hostname}\nUserNS={USERNS}\n{network}{holds}\
          Label={OWNER_LABEL}={token}\nLabel={POD_LABEL}={id}\n{labels}ExitPolicy=continue\nStopTimeout={grace}\n\n\
          [Service]\nTimeoutStopSec={stop}\n",
         header = header(token),
@@ -120,6 +140,15 @@ fn render_pod(id: &str, token: &str, spec: &PodSpec) -> String {
         pod = pod_name(id),
         hostname = spec.hostname,
         network = network(spec),
+        holds = spec
+            .scratch()
+            .filter(|(_, s)| s.medium == Medium::Memory)
+            .map(|(name, _)| format!(
+                "Volume={}:{}:idmap\n",
+                scratch_name(id, name),
+                scratch_hold(name)
+            ))
+            .collect::<String>(),
         labels = client_labels(spec),
         grace = spec.grace_seconds,
         stop = spec.grace_seconds + 30,
@@ -153,6 +182,47 @@ fn render_container(
     }
     if !c.env.is_empty() {
         container.push_str(&format!("EnvironmentFile={base}.env\n"));
+    }
+    match (c.user, c.group) {
+        (Some(user), Some(group)) => container.push_str(&format!("User={user}\nGroup={group}\n")),
+        (Some(user), None) => container.push_str(&format!("User={user}\n")),
+        _ => {}
+    }
+    for group in &spec.supplementary_groups {
+        container.push_str(&format!("GroupAdd={group}\n"));
+    }
+    if c.read_only_root {
+        container.push_str("ReadOnly=true\n");
+    }
+    if c.no_new_privileges {
+        container.push_str("NoNewPrivileges=true\n");
+    }
+    if c.drop_all_capabilities {
+        container.push_str("DropCapability=all\n");
+    }
+    for m in &c.mounts {
+        let source = spec
+            .volumes
+            .iter()
+            .find(|v| v.name == m.volume)
+            .map(|v| match &v.volume {
+                Some(owned) => volume_name(owned),
+                None => scratch_name(id, &v.name),
+            })
+            .expect("validated: mounts name pod volumes");
+        // Idmapped: on disk, IDs stay those seen in the container whatever range the pod's namespace gets.
+        let mut line = format!(
+            "Mount=type=volume,source={source},destination={},idmap",
+            m.path
+        );
+        if let Some(sub) = &m.sub_path {
+            line.push_str(&format!(",subpath={sub}"));
+        }
+        if m.read_only {
+            line.push_str(",ro");
+        }
+        container.push_str(&line);
+        container.push('\n');
     }
     container.push_str(&format!(
         "Label={OWNER_LABEL}={token}\nLabel={POD_LABEL}={id}\n{}StopTimeout={}\n",
@@ -250,6 +320,33 @@ mod tests {
                 "hostname": "db-0",
                 "network": {"name": "rz-0123456789abcdef01234567", "aliases": ["db", "db.shop", "db.shop.svc", "db-0.db", "db-0.db.shop", "db-0.db.shop.svc"]},
                 "containers": [{"name": "db", "image": "docker.io/library/postgres:17-alpine"}]
+            }),
+        );
+    }
+
+    #[test]
+    fn renders_identity_hardening_and_volumes() {
+        golden(
+            "volumes",
+            serde_json::json!({
+                "hostname": "db-0",
+                "supplementary_groups": [2000],
+                "volumes": [
+                    {"name": "data", "volume": "rz-0123456789abcdef01234567"},
+                    {"name": "tmp", "scratch": {"medium": "memory", "bytes": 1048576}},
+                    {"name": "cache", "scratch": {"medium": "disk", "bytes": 1073741824}}
+                ],
+                "containers": [{
+                    "name": "db", "image": "docker.io/library/postgres:17-alpine",
+                    "user": 70, "group": 70, "read_only_root": true, "no_new_privileges": true,
+                    "drop_all_capabilities": true,
+                    "mounts": [
+                        {"volume": "data", "path": "/var/lib/postgresql/data", "sub_path": "pgdata"},
+                        {"volume": "tmp", "path": "/tmp"},
+                        {"volume": "cache", "path": "/cache"},
+                        {"volume": "data", "path": "/backup", "read_only": true}
+                    ]
+                }]
             }),
         );
     }

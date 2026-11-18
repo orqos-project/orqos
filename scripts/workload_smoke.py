@@ -249,6 +249,98 @@ def networks(orqos):
     ok(exists("orqos-net-taken"), "networks Orqos does not own are untouched")
 
 
+def mountpoint(volume):
+    return sh("podman", "volume", "inspect", volume, "--format", "{{.Mountpoint}}")
+
+
+def owner_mode(path):
+    st = os.stat(path)
+    return f"{st.st_uid}:{st.st_gid} {oct(st.st_mode & 0o7777)[2:]}"
+
+
+def storage_spec(level, user=1000):
+    return {"hostname": "st-0", "grace_seconds": 5, "supplementary_groups": [2000],
+            "volumes": [{"name": "data", "volume": "smoke-data"},
+                        {"name": "mem", "scratch": {"medium": "memory", "bytes": 1048576}},
+                        {"name": "disk", "scratch": {"medium": "disk", "bytes": 1048576}}],
+            "containers": [{"name": "app", "image": IMAGE, "user": user, "group": user,
+                            "read_only_root": True, "no_new_privileges": True, "drop_all_capabilities": True,
+                            "command": ["/bin/sh", "-c", "trap 'exit 0' TERM; while true; do sleep 1; done"],
+                            "env": {"LEVEL": level},
+                            "mounts": [{"volume": "data", "path": "/data"}, {"volume": "mem", "path": "/mem"},
+                                       {"volume": "disk", "path": "/disk"},
+                                       {"volume": "data", "path": "/ro", "read_only": True}]}]}
+
+
+def storage(orqos):
+    """Owned volumes keep data across replacement with container-relative ownership; scratch starts empty; the
+    container runs as the given user, read-only, without capabilities or privilege escalation."""
+    code, body = orqos.call("PUT", "/workload/volumes/smoke-data", {"group": 2000, "labels": {"example.org/k": "v"}})
+    ok(code == 200 and body["spec"]["group"] == 2000, f"PUT creates an owned volume ({code} {body})")
+    data = mountpoint("orqos-vol-smoke-data")
+    ok(owner_mode(data) == "0:2000 2775", f"its root is root:2000, setgid group-writable ({owner_mode(data)})")
+    labels = json.loads(sh("podman", "volume", "inspect", "orqos-vol-smoke-data", "--format", "json"))[0]["Labels"]
+    ok("dev.orqos.owner" in labels and labels.get("dev.orqos.volume") == "smoke-data",
+       f"the Podman volume carries ownership labels ({labels})")
+
+    sh("podman", "volume", "create", "--label", "owner=someone-else", "orqos-vol-taken")
+    code, body = orqos.call("PUT", "/workload/volumes/taken", {})
+    ok(code == 409, f"an unowned Podman volume with the same name is not adopted ({code} {body})")
+    unknown = storage_spec("a")
+    unknown["volumes"][0]["volume"] = "missing"
+    code, body = orqos.call("PUT", "/workload/pods/st-unknown", unknown)
+    ok(code == 422 and "unknown volume" in body["error"], f"a pod naming an unknown volume is refused ({code} {body})")
+
+    code, body = orqos.call("PUT", "/workload/pods/st", storage_spec("a"))
+    ok(code == 200, f"apply creates a pod with volumes and hardening ({code} {body.get('error') if isinstance(body, dict) else body})")
+    wait_state(orqos, "st", "running")
+    c = "orqos-st-app"
+    out = sh("podman", "exec", c, "sh", "-c",
+             "id; grep -E 'CapEff|NoNewPrivs' /proc/self/status; echo one > /data/a && echo m > /mem/m && "
+             "echo d > /disk/d && echo wrote; touch /x 2>/dev/null || echo read-only; "
+             "touch /ro/x 2>/dev/null || echo ro-mount; head -c 2000000 /dev/zero > /mem/big 2>/dev/null || echo mem-full; "
+             "rm -f /mem/big")
+    ok("uid=1000 gid=1000" in out and "2000" in out.split("groups=")[1], f"runs as 1000:1000 with group 2000 ({out.splitlines()[0]})")
+    ok("CapEff:\t0000000000000000" in out and "NoNewPrivs:\t1" in out, "no capabilities and no privilege escalation")
+    ok("wrote" in out and "read-only" in out and "ro-mount" in out,
+       "volumes are writable while the root filesystem and read-only mounts are not")
+    ok("mem-full" in out, "memory scratch enforces its size")
+    ok(owner_mode(os.path.join(data, "a")).split()[0] == "1000:2000",
+       f"files keep container-relative ownership on disk, group from the setgid root ({owner_mode(os.path.join(data, 'a'))})")
+
+    other = storage_spec("x", user=1001)
+    code, _ = orqos.call("PUT", "/workload/pods/st2", other)
+    wait_state(orqos, "st2", "running")
+    ok(code == 200 and sh("podman", "exec", "orqos-st2-app", "sh", "-c", "cat /data/a && echo two > /data/b") == "one",
+       "another pod (another user and ID range, same group) reads and writes the volume")
+    code, body = orqos.call("GET", "/workload/volumes")
+    listed = next((v for v in body if v["name"] == "smoke-data"), {}) if code == 200 else {}
+    ok(listed.get("pods") == ["st", "st2"] and listed.get("spec", {}).get("labels") == {"example.org/k": "v"},
+       f"the volumes endpoint lists the volume, its labels and its pods ({listed})")
+    code, _ = orqos.call("DELETE", "/workload/volumes/smoke-data")
+    ok(code == 409, "a mounted volume cannot be deleted")
+
+    code, _ = orqos.call("PUT", "/workload/pods/st", storage_spec("b"))
+    wait_state(orqos, "st", "running")
+    out = sh("podman", "exec", c, "sh", "-c", "cat /data/a /data/b; ls /mem /disk | wc -l")
+    ok(code == 200 and out.split() == ["one", "two", "0"],
+       f"after replacement the volume keeps its data and scratch volumes start empty ({out.split()})")
+    sh("podman", "exec", c, "sh", "-c", "echo kept > /mem/k")
+    sh("podman", "kill", c)
+    time.sleep(2)
+    wait_state(orqos, "st", "running")
+    ok(sh("podman", "exec", c, "cat", "/mem/k") == "kept", "memory scratch survives a container restart")
+
+    for pod in ("st", "st2"):
+        orqos.call("DELETE", f"/workload/pods/{pod}")
+    exists = lambda name: subprocess.run(["podman", "volume", "exists", name]).returncode == 0
+    ok(not exists("orqos-st-scratch-mem") and not exists("orqos-st-scratch-disk"), "removing a pod removes its scratch volumes")
+    ok(exists("orqos-vol-smoke-data"), "owned volumes outlive their pods")
+    code, _ = orqos.call("DELETE", "/workload/volumes/smoke-data")
+    ok(code == 200 and not exists("orqos-vol-smoke-data"), "DELETE removes an unused owned volume")
+    ok(exists("orqos-vol-taken"), "volumes Orqos does not own are untouched")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--orqos", required=True, help="path to the orqos binary")
@@ -262,18 +354,22 @@ def main():
     try:
         run(orqos)
         networks(orqos)
+        storage(orqos)
         print("workload smoke: all checks passed")
     finally:
         try:
             if orqos.process.poll() is None:
-                for pod in ("smoke", "web0", "web1", "other", "nettaken"):
+                for pod in ("smoke", "web0", "web1", "other", "nettaken", "st", "st2", "st-unknown"):
                     orqos.call("DELETE", f"/workload/pods/{pod}")
+                orqos.call("DELETE", "/workload/volumes/smoke-data")
         except Exception:  # cleanup must continue
             pass
         orqos.stop()
         for pod in (FOREIGN, "orqos-taken", "orqos-smoke"):
             subprocess.run(["podman", "pod", "rm", "--force", "--ignore", pod], capture_output=True)
         subprocess.run(["podman", "rm", "--force", "--ignore", "smoke-default-client"], capture_output=True)
+        subprocess.run(["podman", "volume", "rm", "--force", "orqos-vol-taken", "orqos-vol-smoke-data"],
+                       capture_output=True)
         for network in ("orqos-net-taken", "orqos-net-smoke", "orqos-net-smoke-other"):
             subprocess.run(["podman", "network", "rm", "--force", network], capture_output=True)
 

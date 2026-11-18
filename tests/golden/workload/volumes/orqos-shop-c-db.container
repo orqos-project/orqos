@@ -1,0 +1,30 @@
+# Managed by Orqos for owner 0123456789abcdef0123456789abcdef. Do not edit: the next apply replaces this file.
+[Unit]
+Description=Orqos workload pod shop container db owner 0123456789abcdef0123456789abcdef
+StartLimitIntervalSec=0
+
+[Container]
+ContainerName=orqos-shop-db
+Pod=orqos-shop.pod
+Image=docker.io/library/postgres:17-alpine
+User=70
+Group=70
+GroupAdd=2000
+ReadOnly=true
+NoNewPrivileges=true
+DropCapability=all
+Mount=type=volume,source=orqos-vol-rz-0123456789abcdef01234567,destination=/var/lib/postgresql/data,idmap,subpath=pgdata
+Mount=type=volume,source=orqos-shop-scratch-tmp,destination=/tmp,idmap
+Mount=type=volume,source=orqos-shop-scratch-cache,destination=/cache,idmap
+Mount=type=volume,source=orqos-vol-rz-0123456789abcdef01234567,destination=/backup,idmap,ro
+Label=dev.orqos.owner=0123456789abcdef0123456789abcdef
+Label=dev.orqos.pod=shop
+StopTimeout=30
+
+[Service]
+Restart=always
+RestartSec=1s
+RestartSteps=8
+RestartMaxDelaySec=300s
+TimeoutStartSec=600
+TimeoutStopSec=60
