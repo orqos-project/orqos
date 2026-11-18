@@ -411,11 +411,9 @@ impl Probe {
         if !(1..=3600).contains(&self.period_seconds) {
             return Err(format!("{at}.period_seconds: 1 to 3600"));
         }
-        if !(1..=300).contains(&self.timeout_seconds) || self.timeout_seconds > self.period_seconds
-        {
-            return Err(format!(
-                "{at}.timeout_seconds: 1 to 300, and at most period_seconds"
-            ));
+        // As in Kubernetes, a timeout may exceed the period: the next run waits for the current one.
+        if !(1..=300).contains(&self.timeout_seconds) {
+            return Err(format!("{at}.timeout_seconds: 1 to 300"));
         }
         if !(1..=1000).contains(&self.failure_threshold) {
             return Err(format!("{at}.failure_threshold: 1 to 1000"));
@@ -963,8 +961,10 @@ mod tests {
         assert!(
             broken("/containers/0/liveness/period_seconds", json!(0)).contains("period_seconds")
         );
-        assert!(broken("/containers/0/liveness/timeout_seconds", json!(11))
-            .contains("at most period_seconds"));
+        assert!(broken("/containers/0/liveness/timeout_seconds", json!(301)).contains("1 to 300"));
+        let mut long = v.clone();
+        long["containers"][0]["liveness"]["timeout_seconds"] = json!(30);
+        assert!(spec(long).is_ok(), "a timeout may exceed the period");
         assert!(broken("/containers/0/liveness/failure_threshold", json!(0))
             .contains("failure_threshold"));
         assert!(broken("/containers/0/liveness", json!({"exec": ["true"], "http": {"path": "/", "port": 1, "scheme": "http"}, "period_seconds": 1, "timeout_seconds": 1, "failure_threshold": 1})).contains("exactly one"));

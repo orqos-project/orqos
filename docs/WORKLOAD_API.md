@@ -119,8 +119,8 @@ Control characters are rejected everywhere. Unknown fields are rejected.
 ### Probes
 
 A probe is exactly one of `{"exec": [argv]}` or `{"http": {"path", "port", "scheme": "http" | "https"}}`, with
-`period_seconds` (1–3600), `timeout_seconds` (1–300, at most the period) and `failure_threshold` (1–1000), all
-required:
+`period_seconds` (1–3600), `timeout_seconds` (1–300; it may exceed the period, and the next run then waits) and
+`failure_threshold` (1–1000), all required:
 
 ```json
 "readiness": {"http": {"path": "/health/ready", "port": 8080, "scheme": "https"},
