@@ -325,7 +325,7 @@ def storage(orqos):
 
     code, _ = orqos.call("PUT", "/workload/pods/st", storage_spec("b"))
     wait_state(orqos, "st", "running")
-    out = sh("podman", "exec", c, "sh", "-c", "cat /data/a /data/b; ls /mem /disk | wc -l")
+    out = sh("podman", "exec", c, "sh", "-c", "cat /data/a /data/b; find /mem /disk -mindepth 1 | wc -l")
     ok(code == 200 and out.split() == ["one", "two", "0"],
        f"after replacement the volume keeps its data and scratch volumes start empty ({out.split()})")
     sh("podman", "exec", c, "sh", "-c", "echo kept > /mem/k")
