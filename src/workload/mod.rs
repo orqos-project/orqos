@@ -662,6 +662,7 @@ impl WorkloadState {
             &[
                 "ps",
                 "--all",
+                "--no-trunc",
                 "--filter",
                 &format!("label={}={}", render::POD_LABEL, record.id),
                 "--format",

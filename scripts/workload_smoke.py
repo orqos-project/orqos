@@ -686,7 +686,8 @@ def registry(orqos):
     ok(code == 200, f"with the right credentials the private image is pulled and runs ({code})")
     status = wait_state(orqos, "rg", "running")
     image_id = sh("podman", "image", "inspect", "--format", "{{.Id}}", PRIVATE)
-    ok(status["containers"][0]["image_id"] == image_id, f"status shows the image the container runs ({image_id[:12]})")
+    ok(status["containers"][0]["image_id"] == image_id,
+       f"status shows the image the container runs ({status['containers'][0]['image_id']} vs {image_id})")
     auth = os.path.join(FILES, "rg", "registry-auth.json")
     ok(owner_mode(auth) == "0:0 600", f"the merged credentials are a root-only file ({owner_mode(auth)})")
     digest = sh("podman", "image", "inspect", "--format", "{{.Digest}}", PRIVATE)
