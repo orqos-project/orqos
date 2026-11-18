@@ -1,6 +1,7 @@
 //! Workload backend (orqos#16–#18): pods of containers run by rootful Podman as owned Quadlet/systemd units.
 //! See docs/WORKLOAD_API.md.
 pub mod capabilities;
+pub mod files;
 pub mod render;
 pub mod routes;
 pub mod spec;
@@ -14,8 +15,11 @@ use serde::Serialize;
 use tokio::sync::Mutex;
 use utoipa::ToSchema;
 
-use spec::{valid_id, valid_volume_name, Medium, PodSpec, VolumeSpec};
-use store::{Desired, NetworkRecord, Record, Store, VolumeRecord};
+use files::Secrets;
+use spec::{
+    valid_id, valid_secret_name, valid_volume_name, Medium, PodSpec, SecretSpec, VolumeSpec,
+};
+use store::{Desired, NetworkRecord, Record, SecretRecord, Store, VolumeRecord};
 use units::{Ownership, Paths};
 
 #[derive(Debug)]
@@ -152,6 +156,26 @@ pub struct VolumeStatus {
     pub updated_at: String,
 }
 
+/// An owned secret: its keys and labels, never its values.
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct SecretStatus {
+    pub name: String,
+    pub keys: Vec<String>,
+    pub labels: BTreeMap<String, String>,
+    /// Pods whose records use the secret, as files or environment variables.
+    pub pods: Vec<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// IDs of the pods whose records use an owned secret.
+pub fn referencing<'a>(secret: &str, pods: &'a [Record]) -> Vec<&'a str> {
+    pods.iter()
+        .filter(|p| p.spec.secrets().contains(secret))
+        .map(|p| p.id.as_str())
+        .collect()
+}
+
 /// IDs of the pods whose records mount an owned volume.
 pub fn mounting<'a>(volume: &str, pods: &'a [Record]) -> Vec<&'a str> {
     pods.iter()
@@ -181,6 +205,7 @@ pub struct WorkloadState {
     store: Store,
     networks: Store<NetworkRecord>,
     volumes: Store<VolumeRecord>,
+    secrets: Store<SecretRecord>,
     // Serializes every operation: unit files, systemd state and records change together.
     lock: Mutex<()>,
 }
@@ -198,12 +223,14 @@ impl WorkloadState {
         let store = Store::open(&paths.state)?;
         let networks = Store::open(&paths.state.join("networks"))?;
         let volumes = Store::open(&paths.state.join("volumes"))?;
+        let secrets = Store::open(&paths.state.join("secrets"))?;
         Ok(Self {
             token,
             paths,
             store,
             networks,
             volumes,
+            secrets,
             lock: Mutex::new(()),
         })
     }
@@ -369,6 +396,70 @@ impl WorkloadState {
         Ok(())
     }
 
+    /// Where secret volumes are written.
+    fn files_root(&self) -> std::path::PathBuf {
+        self.paths.state.join("files")
+    }
+
+    /// Loads every secret the spec uses and checks what it takes from them: keys exist, environment values are
+    /// UTF-8 without control characters, and a mount's `sub_path` names a projected file or directory.
+    fn verify_secrets(&self, spec: &PodSpec) -> Result<Secrets, WorkloadError> {
+        let mut secrets = Secrets::new();
+        for name in spec.secrets() {
+            let record = self.secrets.load(name).map_err(storage)?.ok_or_else(|| {
+                WorkloadError::Invalid(format!(
+                    "unknown secret {name:?}: create it with PUT /workload/secrets/{name} first"
+                ))
+            })?;
+            let data = record.spec.decode().map_err(|e| {
+                WorkloadError::Backend(format!("corrupt record of secret {name:?}: {e}"))
+            })?;
+            secrets.insert(name.to_string(), data);
+        }
+        let missing = |secret: &str, key: &str| {
+            WorkloadError::Invalid(format!("secret {secret:?} has no key {key:?}"))
+        };
+        for (volume, files) in spec.secret_files() {
+            let data = &secrets[&files.name];
+            let projected = files.files(data.keys().map(String::as_str));
+            for (key, _) in &projected {
+                if !data.contains_key(*key) {
+                    return Err(missing(&files.name, key));
+                }
+            }
+            for c in &spec.containers {
+                for m in c.mounts.iter().filter(|m| m.volume == volume) {
+                    let Some(sub) = m.sub_path.as_deref().map(|p| p.trim_end_matches('/')) else {
+                        continue;
+                    };
+                    if !projected
+                        .iter()
+                        .any(|(_, path)| *path == sub || path.starts_with(&format!("{sub}/")))
+                    {
+                        return Err(WorkloadError::Invalid(format!(
+                            "container {:?} mounts sub_path {sub:?} of secret volume {volume:?}, which has no such file or directory",
+                            c.name
+                        )));
+                    }
+                }
+            }
+        }
+        for c in &spec.containers {
+            for (variable, r) in &c.secret_env {
+                let value = secrets[&r.secret]
+                    .get(&r.key)
+                    .ok_or_else(|| missing(&r.secret, &r.key))?;
+                if std::str::from_utf8(value).map_or(true, |v| v.chars().any(char::is_control)) {
+                    return Err(WorkloadError::Invalid(format!(
+                        "container {:?} variable {variable}: key {:?} of secret {:?} is not UTF-8 without control characters",
+                        c.name, r.key, r.secret
+                    )));
+                }
+            }
+        }
+        Ok(secrets)
+    }
+
     /// Creates the pod's missing scratch volumes, owned by the pod's token. A scratch volume of that name owned
     /// by anything else is refused.
     async fn prepare_scratch(
@@ -509,11 +600,21 @@ impl WorkloadState {
             record.spec.network.as_ref().map(|n| &n.name) != spec.network.as_ref().map(|n| &n.name);
         self.ensure_network(&spec).await?;
         self.verify_volumes(&spec).await?;
+        let secrets = self.verify_secrets(&spec)?;
         self.prepare_scratch(id, &record.token, &spec).await?;
+        // The old units are stopped when the spec changed, so no container sees the files change.
+        let root = self.files_root();
+        if changed || !files::present(&root, id, &spec) {
+            files::project(&root, id, &spec, &secrets)?;
+        }
         record.spec = spec;
         record.desired = Desired::Running;
         if changed {
-            let files = render::render(id, &record.token, &record.spec);
+            let inputs = render::Inputs {
+                files: &root,
+                secrets: &secrets,
+            };
+            let files = render::render(id, &record.token, &record.spec, &inputs);
             units::install(&self.paths, id, &record.token, &files).await?;
         }
         self.save(&mut record, None)?;
@@ -537,8 +638,13 @@ impl WorkloadState {
         let result = async {
             self.ensure_network(&record.spec).await?;
             self.verify_volumes(&record.spec).await?;
+            let secrets = self.verify_secrets(&record.spec)?;
             self.prepare_scratch(id, &record.token, &record.spec)
                 .await?;
+            let root = self.files_root();
+            if !files::present(&root, id, &record.spec) {
+                files::project(&root, id, &record.spec, &secrets)?;
+            }
             units::systemctl("start", &render::pod_unit(id)).await
         }
         .await;
@@ -576,6 +682,7 @@ impl WorkloadState {
             .await?;
         }
         self.remove_scratch(id, &record.token, &record.spec).await?;
+        files::remove(&self.files_root(), id)?;
         self.store.remove(id).map_err(storage)?;
         if record.spec.network.is_some() {
             for problem in self.release_networks().await {
@@ -732,6 +839,103 @@ impl WorkloadState {
             }
         }
         self.volumes.remove(name).map_err(storage)?;
+        Ok(serde_json::json!({"name": name, "status": "removed"}))
+    }
+
+    fn secret_status(record: SecretRecord, pods: &[Record]) -> SecretStatus {
+        SecretStatus {
+            pods: referencing(&record.name, pods)
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            keys: record.spec.data.keys().cloned().collect(),
+            labels: record.spec.labels,
+            name: record.name,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+        }
+    }
+
+    fn check_secret_name(name: &str) -> Result<(), WorkloadError> {
+        if valid_secret_name(name) {
+            Ok(())
+        } else {
+            Err(WorkloadError::Invalid(
+                "secret name: a DNS label of at most 48 characters".into(),
+            ))
+        }
+    }
+
+    /// Creates an owned secret, or updates its labels. Its data never changes: different data for an existing
+    /// name is refused, so pods using a secret never see it change underneath them.
+    pub async fn apply_secret(
+        &self,
+        name: &str,
+        spec: SecretSpec,
+    ) -> Result<SecretStatus, WorkloadError> {
+        Self::check_secret_name(name)?;
+        let decoded = spec.decode().map_err(WorkloadError::Invalid)?;
+        let _guard = self.lock.lock().await;
+        let now = chrono::Utc::now().to_rfc3339();
+        let record = match self.secrets.load(name).map_err(storage)? {
+            Some(mut record) => {
+                let existing = record.spec.decode().map_err(|e| {
+                    WorkloadError::Backend(format!("corrupt record of secret {name:?}: {e}"))
+                })?;
+                if existing != decoded {
+                    return Err(WorkloadError::Conflict(format!(
+                        "secret {name:?} exists with different data; secrets are immutable, so create a new one"
+                    )));
+                }
+                if record.spec.labels != spec.labels {
+                    record.spec.labels = spec.labels;
+                    record.updated_at = now;
+                    self.secrets.save(&record).map_err(storage)?;
+                }
+                record
+            }
+            None => {
+                let record = SecretRecord {
+                    name: name.into(),
+                    token: store::new_token(),
+                    spec,
+                    created_at: now.clone(),
+                    updated_at: now,
+                };
+                self.secrets.save(&record).map_err(storage)?;
+                record
+            }
+        };
+        let pods = self.store.list().map_err(storage)?;
+        Ok(Self::secret_status(record, &pods))
+    }
+
+    pub async fn secrets(&self) -> Result<Vec<SecretStatus>, WorkloadError> {
+        let pods = self.store.list().map_err(storage)?;
+        Ok(self
+            .secrets
+            .list()
+            .map_err(storage)?
+            .into_iter()
+            .map(|record| Self::secret_status(record, &pods))
+            .collect())
+    }
+
+    /// Deletes an owned secret. Refused while any pod uses it.
+    pub async fn remove_secret(&self, name: &str) -> Result<serde_json::Value, WorkloadError> {
+        Self::check_secret_name(name)?;
+        let _guard = self.lock.lock().await;
+        if self.secrets.load(name).map_err(storage)?.is_none() {
+            return Err(WorkloadError::NotFound(format!("no secret {name:?}")));
+        }
+        let pods = self.store.list().map_err(storage)?;
+        let users = referencing(name, &pods);
+        if !users.is_empty() {
+            return Err(WorkloadError::Conflict(format!(
+                "secret {name:?} is used by pods {users:?}"
+            )));
+        }
+        self.secrets.remove(name).map_err(storage)?;
         Ok(serde_json::json!({"name": name, "status": "removed"}))
     }
 
@@ -908,6 +1112,45 @@ mod tests {
         ];
         assert_eq!(mounting("data", &pods), ["a", "b"]);
         assert!(mounting("other", &pods).is_empty());
+    }
+
+    #[test]
+    fn secrets_know_the_pods_that_use_them() {
+        let pod = |id: &str, volumes: serde_json::Value, secret_env: serde_json::Value| Record {
+            id: id.into(),
+            token: store::new_token(),
+            spec: serde_json::from_value(serde_json::json!({
+                "hostname": id, "volumes": volumes,
+                "containers": [{"name": "c", "image": "alpine", "secret_env": secret_env}],
+            }))
+            .unwrap(),
+            desired: Desired::Running,
+            error: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let pods = [
+            pod(
+                "files",
+                serde_json::json!([{"name": "tls", "secret": {"name": "tls"}}]),
+                serde_json::json!({}),
+            ),
+            pod(
+                "env",
+                serde_json::json!([]),
+                serde_json::json!({"P": {"secret": "db", "key": "password"}}),
+            ),
+            pod(
+                "both",
+                serde_json::json!([{"name": "db", "volume": "db"}, {"name": "t", "secret": {"name": "tls"}}]),
+                serde_json::json!({"P": {"secret": "db", "key": "password"}}),
+            ),
+        ];
+        assert_eq!(referencing("tls", &pods), ["files", "both"]);
+        assert_eq!(referencing("db", &pods), ["env", "both"]);
+        assert!(referencing("other", &pods).is_empty());
+        // An owned volume named like a secret is not a use of the secret.
+        assert_eq!(mounting("db", &pods), ["both"]);
     }
 
     #[test]

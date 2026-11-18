@@ -1,11 +1,21 @@
 //! Renders a pod spec into Quadlet unit files. Pure functions: the output depends only on the pod ID, its
-//! ownership token and the validated spec.
+//! ownership token, the validated spec and its [`Inputs`] (where secret files live, and the secrets' values).
 //!
 //! Quoting follows what was verified against Quadlet 5.7 and systemd 259: `command` (plus `args`) travels as a
 //! JSON `Entrypoint=`, which carries any argument intact; bare `args` use systemd command-line quoting (empty and
 //! lone ";" arguments are rejected by validation); environment values go through `EnvironmentFile=`, which
 //! Podman reads literally. `%` and `$` are escaped wherever systemd would expand them.
+use std::path::Path;
+
+use super::files::{self, Secrets};
 use super::spec::{ContainerSpec, Medium, PodSpec, Restart};
+
+/// What rendering needs beyond the spec: the root of secret files and the values of the secrets the pod uses
+/// (verified to exist, and to be UTF-8 without control characters where they become environment variables).
+pub struct Inputs<'a> {
+    pub files: &'a Path,
+    pub secrets: &'a Secrets,
+}
 
 pub const OWNER_LABEL: &str = "dev.orqos.owner";
 pub const POD_LABEL: &str = "dev.orqos.pod";
@@ -104,26 +114,38 @@ fn header(token: &str) -> String {
     )
 }
 
-pub fn render(id: &str, token: &str, spec: &PodSpec) -> Vec<File> {
+pub fn render(id: &str, token: &str, spec: &PodSpec, inputs: &Inputs) -> Vec<File> {
     let mut files = vec![File {
         name: format!("{}.pod", pod_name(id)),
         content: render_pod(id, token, spec),
     }];
     for container in &spec.containers {
         let base = format!("orqos-{id}-c-{}", container.name);
-        if !container.env.is_empty() {
+        if !container.env.is_empty() || !container.secret_env.is_empty() {
+            let secret_env = container.secret_env.iter().map(|(k, r)| {
+                let value = inputs
+                    .secrets
+                    .get(&r.secret)
+                    .and_then(|data| data.get(&r.key))
+                    .map(|v| String::from_utf8_lossy(v).into_owned())
+                    .unwrap_or_default();
+                (k, value)
+            });
+            let mut lines: Vec<(&String, String)> = container
+                .env
+                .iter()
+                .map(|(k, v)| (k, v.clone()))
+                .chain(secret_env)
+                .collect();
+            lines.sort();
             files.push(File {
                 name: format!("{base}.env"),
-                content: container
-                    .env
-                    .iter()
-                    .map(|(k, v)| format!("{k}={v}\n"))
-                    .collect(),
+                content: lines.iter().map(|(k, v)| format!("{k}={v}\n")).collect(),
             });
         }
         files.push(File {
             name: format!("{base}.container"),
-            content: render_container(id, token, spec, container, &base),
+            content: render_container(id, token, spec, container, &base, inputs.files),
         });
     }
     files
@@ -161,6 +183,7 @@ fn render_container(
     spec: &PodSpec,
     c: &ContainerSpec,
     base: &str,
+    files_root: &Path,
 ) -> String {
     let mut container = format!(
         "[Container]\nContainerName={pod}-{name}\nPod={pod}.pod\nImage={image}\n",
@@ -180,7 +203,7 @@ fn render_container(
         }
         _ => {}
     }
-    if !c.env.is_empty() {
+    if !c.env.is_empty() || !c.secret_env.is_empty() {
         container.push_str(&format!("EnvironmentFile={base}.env\n"));
     }
     match (c.user, c.group) {
@@ -201,15 +224,25 @@ fn render_container(
         container.push_str("DropCapability=all\n");
     }
     for m in &c.mounts {
-        let source = spec
+        let volume = spec
             .volumes
             .iter()
             .find(|v| v.name == m.volume)
-            .map(|v| match &v.volume {
-                Some(owned) => volume_name(owned),
-                None => scratch_name(id, &v.name),
-            })
             .expect("validated: mounts name pod volumes");
+        if volume.secret.is_some() {
+            // Root-owned files, read-only; idmapped so their IDs inside match those on disk.
+            let source = files::source(files_root, id, &volume.name, m.sub_path.as_deref());
+            container.push_str(&format!(
+                "Mount=type=bind,source={},destination={},ro,idmap\n",
+                source.display(),
+                m.path
+            ));
+            continue;
+        }
+        let source = match &volume.volume {
+            Some(owned) => volume_name(owned),
+            None => scratch_name(id, &volume.name),
+        };
         // Idmapped: on disk, IDs stay those seen in the container whatever range the pod's namespace gets.
         let mut line = format!(
             "Mount=type=volume,source={source},destination={},idmap",
@@ -257,7 +290,16 @@ mod tests {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/golden/workload")
             .join(case);
-        let files = render("shop", TOKEN, &spec);
+        let secrets: Secrets = serde_json::from_value(serde_json::json!({
+            "rz-tls": {"tls.crt": b"CERT".to_vec(), "tls.key": b"KEY".to_vec()},
+            "rz-db": {"password": b"p a$$ \"w%rd\" #1".to_vec()}
+        }))
+        .unwrap();
+        let inputs = Inputs {
+            files: Path::new("/var/lib/orqos/workload/files"),
+            secrets: &secrets,
+        };
+        let files = render("shop", TOKEN, &spec, &inputs);
         if std::env::var_os("UPDATE_GOLDEN").is_some() {
             std::fs::create_dir_all(&dir).unwrap();
             for file in &files {
@@ -345,6 +387,32 @@ mod tests {
                         {"volume": "tmp", "path": "/tmp"},
                         {"volume": "cache", "path": "/cache"},
                         {"volume": "data", "path": "/backup", "read_only": true}
+                    ]
+                }]
+            }),
+        );
+    }
+
+    #[test]
+    fn renders_secret_files_and_environment() {
+        golden(
+            "secrets",
+            serde_json::json!({
+                "hostname": "api-0",
+                "supplementary_groups": [2000],
+                "volumes": [
+                    {"name": "tls", "secret": {"name": "rz-tls", "mode": 288, "group": 2000}},
+                    {"name": "settings", "secret": {"name": "rz-tls", "items": [{"key": "tls.crt", "path": "certs/ca.pem"}]}}
+                ],
+                "containers": [{
+                    "name": "api", "image": "registry.example.com/api:1",
+                    "user": 1000, "read_only_root": true,
+                    "env": {"LEVEL": "info"},
+                    "secret_env": {"DB_PASSWORD": {"secret": "rz-db", "key": "password"}},
+                    "mounts": [
+                        {"volume": "tls", "path": "/etc/tls"},
+                        {"volume": "settings", "path": "/etc/app/ca.pem", "sub_path": "certs/ca.pem"},
+                        {"volume": "settings", "path": "/etc/certs", "read_only": false}
                     ]
                 }]
             }),

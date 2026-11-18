@@ -32,7 +32,8 @@ pub struct PodSpec {
     pub volumes: Vec<PodVolume>,
 }
 
-/// A pod volume: exactly one of `volume` (an owned volume, `PUT /workload/volumes/{name}`) or `scratch`.
+/// A pod volume: exactly one of `volume` (an owned volume, `PUT /workload/volumes/{name}`), `scratch` or `secret`
+/// (files from an owned secret, `PUT /workload/secrets/{name}`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PodVolume {
@@ -42,6 +43,113 @@ pub struct PodVolume {
     pub volume: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scratch: Option<Scratch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<SecretFiles>,
+}
+
+/// Keys of an owned secret written as files when the pod starts, mounted read-only. The volume replaces whatever
+/// the image has at the mount path.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SecretFiles {
+    /// The owned secret.
+    pub name: String,
+    /// Keys to write and their relative paths; without it, every key under its own name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub items: Option<Vec<SecretItem>>,
+    /// Mode of every file (at most 0777); directories get `r-x` wherever files get `r`.
+    #[serde(default = "default_mode")]
+    pub mode: u32,
+    /// Group of every file and directory (their owner is root); `root` without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SecretItem {
+    pub key: String,
+    /// Relative path of the file inside the volume.
+    pub path: String,
+}
+
+/// One key of an owned secret.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SecretKeyRef {
+    pub secret: String,
+    pub key: String,
+}
+
+fn default_mode() -> u32 {
+    0o644
+}
+
+/// The spec of an owned secret (`PUT /workload/secrets/{name}`): named data whose values are never returned.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SecretSpec {
+    /// Values by key, base64-encoded. Immutable once created: changed data needs a new secret.
+    pub data: BTreeMap<String, String>,
+    /// The client's own labels, kept in Orqos's record (updatable).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
+}
+
+/// Decoded secret data may total at most 1 MiB, like a Kubernetes Secret.
+pub const MAX_SECRET_BYTES: usize = 1 << 20;
+
+impl SecretSpec {
+    /// Checks the spec and returns the decoded values.
+    pub fn decode(&self) -> Result<BTreeMap<String, Vec<u8>>, String> {
+        use base64::Engine;
+        if self.data.len() > 256 {
+            return Err("data: at most 256 keys".into());
+        }
+        let mut decoded = BTreeMap::new();
+        let mut total = 0;
+        for (key, value) in &self.data {
+            if !valid_secret_key(key) {
+                return Err(format!(
+                    "data: invalid key {key:?} (letters, digits, '-', '_' and '.', at most 253; not \".\" or \"..\")"
+                ));
+            }
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(value)
+                .map_err(|_| format!("data.{key}: not standard base64"))?;
+            total += bytes.len();
+            decoded.insert(key.clone(), bytes);
+        }
+        if total > MAX_SECRET_BYTES {
+            return Err(format!("data: at most {MAX_SECRET_BYTES} bytes in total"));
+        }
+        validate_labels(&self.labels)?;
+        Ok(decoded)
+    }
+}
+
+/// Owned secret names, like volume names.
+pub fn valid_secret_name(name: &str) -> bool {
+    is_label(name, 48)
+}
+
+/// Kubernetes' key grammar: `[-._a-zA-Z0-9]{1,253}`, not `.` or `..`. Keys are also file names.
+pub fn valid_secret_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 253
+        && key != "."
+        && key != ".."
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-._".contains(&b))
+}
+
+/// A relative file path of plain components (no empty, `.` or `..` components).
+fn valid_item_path(path: &str) -> bool {
+    valid_path(path, false)
+        && path
+            .split('/')
+            .all(|c| !c.is_empty() && c != "." && c != "..")
 }
 
 /// Empty when the pod is created or replaced, shared by its containers, removed with the pod.
@@ -84,6 +192,58 @@ pub struct VolumeSpec {
     /// The client's own labels, kept in Orqos's record (updatable), never on the Podman volume.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
+}
+
+impl SecretFiles {
+    fn validate(&self, at: &str) -> Result<(), String> {
+        if !valid_secret_name(&self.name) {
+            return Err(format!("{at}.name: a DNS label of at most 48 characters"));
+        }
+        if self.mode > 0o777 {
+            return Err(format!("{at}.mode: at most 0777 (511)"));
+        }
+        if self.group.is_some_and(|g| g > MAX_ID) {
+            return Err(format!("{at}.group: at most {MAX_ID}"));
+        }
+        let Some(items) = &self.items else {
+            return Ok(());
+        };
+        if items.is_empty() || items.len() > 256 {
+            return Err(format!("{at}.items: omit it or list 1 to 256 items"));
+        }
+        let mut paths: BTreeSet<&str> = BTreeSet::new();
+        for (k, item) in items.iter().enumerate() {
+            if !valid_secret_key(&item.key) {
+                return Err(format!("{at}.items[{k}].key: invalid key"));
+            }
+            if !valid_item_path(&item.path) {
+                return Err(format!(
+                    "{at}.items[{k}].path: a relative path of letters, digits and / . _ - + @, without empty, '.' or '..' components"
+                ));
+            }
+            // A path cannot be both a file and a directory of another item.
+            if paths.iter().any(|p| {
+                *p == item.path
+                    || p.starts_with(&format!("{}/", item.path))
+                    || item.path.starts_with(&format!("{p}/"))
+            }) {
+                return Err(format!("{at}.items[{k}].path: conflicts with another item"));
+            }
+            paths.insert(&item.path);
+        }
+        Ok(())
+    }
+
+    /// Each projected file's key and relative path, given the secret's keys.
+    pub fn files<'a>(&'a self, keys: impl Iterator<Item = &'a str>) -> Vec<(&'a str, &'a str)> {
+        match &self.items {
+            Some(items) => items
+                .iter()
+                .map(|i| (i.key.as_str(), i.path.as_str()))
+                .collect(),
+            None => keys.map(|k| (k, k)).collect(),
+        }
+    }
 }
 
 /// User, group and supplementary IDs must fall inside the pod's 65536-ID user namespace.
@@ -156,6 +316,10 @@ pub struct ContainerSpec {
     /// Environment variables, passed literally.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
+    /// Environment variables from owned secrets: values are UTF-8 without control characters. Names are disjoint
+    /// from `env`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub secret_env: BTreeMap<String, SecretKeyRef>,
     /// UID to run as (inside the pod's user namespace); the image's user when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<u32>,
@@ -264,6 +428,26 @@ impl PodSpec {
         self.volumes.iter().filter_map(|v| v.volume.as_deref())
     }
 
+    /// Names of the owned secrets the pod uses, as files or environment variables.
+    pub fn secrets(&self) -> BTreeSet<&str> {
+        self.volumes
+            .iter()
+            .filter_map(|v| v.secret.as_ref().map(|s| s.name.as_str()))
+            .chain(
+                self.containers
+                    .iter()
+                    .flat_map(|c| c.secret_env.values().map(|r| r.secret.as_str())),
+            )
+            .collect()
+    }
+
+    /// The pod's secret volumes.
+    pub fn secret_files(&self) -> impl Iterator<Item = (&str, &SecretFiles)> {
+        self.volumes
+            .iter()
+            .filter_map(|v| Some((v.name.as_str(), v.secret.as_ref()?)))
+    }
+
     /// The pod's scratch volumes.
     pub fn scratch(&self) -> impl Iterator<Item = (&str, &Scratch)> {
         self.volumes
@@ -303,14 +487,15 @@ impl PodSpec {
             if !volumes.insert(v.name.as_str()) {
                 return Err(format!("{at}.name: duplicate volume name {:?}", v.name));
             }
-            match (&v.volume, &v.scratch) {
-                (Some(name), None) if valid_volume_name(name) => {}
-                (Some(_), None) => {
+            match (&v.volume, &v.scratch, &v.secret) {
+                (Some(name), None, None) if valid_volume_name(name) => {}
+                (Some(_), None, None) => {
                     return Err(format!("{at}.volume: a DNS label of at most 48 characters"))
                 }
-                (None, Some(scratch)) if scratch.bytes > 0 => {}
-                (None, Some(_)) => return Err(format!("{at}.scratch.bytes: at least 1")),
-                _ => return Err(format!("{at}: exactly one of volume or scratch")),
+                (None, Some(scratch), None) if scratch.bytes > 0 => {}
+                (None, Some(_), None) => return Err(format!("{at}.scratch.bytes: at least 1")),
+                (None, None, Some(files)) => files.validate(&format!("{at}.secret"))?,
+                _ => return Err(format!("{at}: exactly one of volume, scratch or secret")),
             }
         }
         if let Some(network) = &self.network {
@@ -405,6 +590,25 @@ impl PodSpec {
                     return Err(format!(
                         "{at}.env.{key}: control characters are not allowed"
                     ));
+                }
+            }
+            if c.env.len() + c.secret_env.len() > 256 {
+                return Err(format!("{at}: at most 256 environment variables"));
+            }
+            for (key, reference) in &c.secret_env {
+                if !valid_env_key(key) {
+                    return Err(format!("{at}.secret_env: invalid variable name {key:?}"));
+                }
+                if c.env.contains_key(key) {
+                    return Err(format!("{at}.secret_env.{key}: also set in env"));
+                }
+                if !valid_secret_name(&reference.secret) {
+                    return Err(format!(
+                        "{at}.secret_env.{key}.secret: a DNS label of at most 48 characters"
+                    ));
+                }
+                if !valid_secret_key(&reference.key) {
+                    return Err(format!("{at}.secret_env.{key}.key: invalid key"));
                 }
             }
         }
@@ -559,6 +763,102 @@ mod tests {
         let mut g = v.clone();
         g["containers"][0].as_object_mut().unwrap().remove("user");
         assert!(spec(g).unwrap_err().contains("needs user"));
+    }
+
+    #[test]
+    fn secret_volumes_and_environment_are_checked() {
+        let mut v = minimal();
+        v["volumes"] = json!([
+            {"name": "tls", "secret": {"name": "rz-tls", "mode": 288, "group": 2000}},
+            {"name": "conf", "secret": {"name": "rz-conf", "items": [
+                {"key": "settings.json", "path": "settings.json"},
+                {"key": "ca.crt", "path": "certs/ca.pem"}
+            ]}}
+        ]);
+        v["containers"][0]["env"] = json!({"LEVEL": "info"});
+        v["containers"][0]["secret_env"] =
+            json!({"DB_PASSWORD": {"secret": "rz-db", "key": "password"}});
+        v["containers"][0]["mounts"] = json!([{"volume": "tls", "path": "/etc/tls"}]);
+        let ok = spec(v.clone()).unwrap();
+        assert_eq!(
+            ok.secrets().into_iter().collect::<Vec<_>>(),
+            ["rz-conf", "rz-db", "rz-tls"]
+        );
+        assert_eq!(ok.volumes[1].secret.as_ref().unwrap().mode, 0o644);
+        assert_eq!(ok.secret_files().count(), 2);
+
+        let broken = |pointer: &str, value: serde_json::Value| {
+            let mut b = v.clone();
+            *b.pointer_mut(pointer).unwrap() = value;
+            spec(b).unwrap_err()
+        };
+        assert!(broken("/volumes/0/secret/mode", json!(512)).contains("0777"));
+        assert!(broken("/volumes/0/secret/group", json!(65536)).contains("65535"));
+        assert!(broken("/volumes/0/secret/name", json!("Bad")).contains("48"));
+        assert!(broken("/volumes/1/secret/items", json!([])).contains("1 to 256"));
+        for bad in ["/abs", "a/../b", "./a", "a//b", "a/", "a,b", ""] {
+            assert!(
+                broken("/volumes/1/secret/items/0/path", json!(bad)).contains("relative path"),
+                "{bad:?}"
+            );
+        }
+        assert!(broken("/volumes/1/secret/items/0/path", json!("certs")).contains("conflicts"));
+        assert!(
+            broken("/volumes/1/secret/items/0/path", json!("certs/ca.pem")).contains("conflicts")
+        );
+        assert!(broken("/volumes/1/secret/items/0/key", json!("..")).contains("invalid key"));
+        assert!(broken("/volumes/1/secret/items/0/key", json!("a/b")).contains("invalid key"));
+        assert!(broken(
+            "/volumes/0",
+            json!({"name": "tls", "volume": "v", "secret": {"name": "s"}})
+        )
+        .contains("exactly one"));
+        assert!(broken(
+            "/containers/0/secret_env",
+            json!({"LEVEL": {"secret": "s", "key": "k"}})
+        )
+        .contains("also set in env"));
+        assert!(broken(
+            "/containers/0/secret_env",
+            json!({"1X": {"secret": "s", "key": "k"}})
+        )
+        .contains("variable name"));
+        assert!(broken(
+            "/containers/0/secret_env",
+            json!({"X": {"secret": "S", "key": "k"}})
+        )
+        .contains(".secret"));
+        assert!(broken(
+            "/containers/0/secret_env",
+            json!({"X": {"secret": "s", "key": "."}})
+        )
+        .contains(".key"));
+    }
+
+    #[test]
+    fn secret_specs_are_checked_and_decoded() {
+        let ok: SecretSpec = serde_json::from_value(
+            json!({"data": {"tls.crt": "Q0VSVA==", ".dockerconfigjson": ""}, "labels": {"dev.rezn.kind": "secret"}}),
+        )
+        .unwrap();
+        let decoded = ok.decode().unwrap();
+        assert_eq!(decoded["tls.crt"], b"CERT");
+        assert_eq!(decoded[".dockerconfigjson"], b"");
+        let check = |data: serde_json::Value| {
+            serde_json::from_value::<SecretSpec>(json!({"data": data}))
+                .unwrap()
+                .decode()
+                .unwrap_err()
+        };
+        assert!(check(json!({"k": "not base64!"})).contains("base64"));
+        assert!(check(json!({"..": ""})).contains("invalid key"));
+        assert!(check(json!({"a b": ""})).contains("invalid key"));
+        use base64::Engine;
+        let big = base64::engine::general_purpose::STANDARD.encode(vec![0u8; MAX_SECRET_BYTES + 1]);
+        assert!(check(json!({"k": big})).contains("in total"));
+        assert!(serde_json::from_value::<SecretSpec>(json!({"data": {}, "type": "tls"})).is_err());
+        assert!(valid_secret_key(&"k".repeat(253)));
+        assert!(!valid_secret_key(&"k".repeat(254)));
     }
 
     #[test]
